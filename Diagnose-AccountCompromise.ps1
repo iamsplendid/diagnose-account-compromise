@@ -176,3 +176,37 @@ function Get-SignInActivity {
         return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; All = @(); InWindow = @(); Baseline = @() }
     }
 }
+
+function Get-MailboxConfig {
+    param([string]$Upn)
+    Write-Step "Collecting mailbox configuration..."
+    try {
+        $mb = Get-Mailbox -Identity $Upn -ErrorAction Stop
+        $data = [PSCustomObject]@{
+            ForwardingAddress              = $mb.ForwardingAddress
+            ForwardingSmtpAddress          = $mb.ForwardingSmtpAddress
+            DeliverToMailboxAndForward     = $mb.DeliverToMailboxAndForward
+            HiddenFromAddressListsEnabled  = $mb.HiddenFromAddressListsEnabled
+            AuditEnabled                   = $mb.AuditEnabled
+            RecipientTypeDetails           = $mb.RecipientTypeDetails
+        }
+        Write-Done "Mailbox config collected (ForwardingSmtp: $($mb.ForwardingSmtpAddress))"
+        return [PSCustomObject]@{ Ok = $true; Data = $data }
+    } catch {
+        Write-Fail "Get-MailboxConfig failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = $null }
+    }
+}
+
+function Get-InboxRules {
+    param([string]$Upn)
+    Write-Step "Collecting inbox rules..."
+    try {
+        $rules = @(Get-InboxRule -Mailbox $Upn -ErrorAction Stop)
+        Write-Done "Inbox rules: $($rules.Count) found"
+        return [PSCustomObject]@{ Ok = $true; Data = $rules }
+    } catch {
+        Write-Fail "Get-InboxRules failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = @() }
+    }
+}
