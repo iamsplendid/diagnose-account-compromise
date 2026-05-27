@@ -210,3 +210,41 @@ function Get-InboxRules {
         return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = @() }
     }
 }
+
+function Get-MailboxAuditEvents {
+    param([string]$Upn, [int]$DaysBack)
+    Write-Step "Collecting mailbox audit log..."
+    try {
+        $start = (Get-Date).AddDays(-$DaysBack)
+        $ops = @('SendAs','SendOnBehalf','HardDelete','MoveToDeletedItems','UpdateFolderPermissions')
+        $results = @(Search-MailboxAuditLog -Identity $Upn -StartDate $start -EndDate (Get-Date) `
+            -Operations $ops -LogonTypes Admin,Delegate,Owner -ResultSize 250000 -ErrorAction Stop)
+        if ($results.Count -ge 250000) {
+            Write-Warn "Mailbox audit result limit reached (250,000). Some events may be missing."
+        }
+        Write-Done "Audit events: $($results.Count) found"
+        return [PSCustomObject]@{ Ok = $true; Data = $results }
+    } catch {
+        Write-Fail "Get-MailboxAuditEvents failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = @() }
+    }
+}
+
+function Get-TransportRuleMatches {
+    param([string]$Upn)
+    Write-Step "Collecting transport rules..."
+    try {
+        $domain = ($Upn -split '@')[1]
+        $all = @(Get-TransportRule -ErrorAction Stop)
+        $matched = @($all | Where-Object {
+            ($_.From -contains $Upn) -or
+            ($_.FromMemberOf -contains $Upn) -or
+            ($_.SenderDomainIs -contains $domain)
+        })
+        Write-Done "Transport rules: $($matched.Count) match this sender"
+        return [PSCustomObject]@{ Ok = $true; Data = $matched }
+    } catch {
+        Write-Fail "Get-TransportRuleMatches failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = @() }
+    }
+}
