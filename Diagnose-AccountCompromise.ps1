@@ -634,3 +634,73 @@ th { background:#eef3fb; font-weight:700; }
 </body></html>
 "@
 }
+
+# =============================================================================
+# Main execution
+# =============================================================================
+Write-Info "Diagnose-AccountCompromise v$ScriptVersion"
+Write-Info "Target: $UserPrincipalName | Lookback: $DaysBack days"
+
+try {
+    Assert-Sessions
+} catch {
+    Write-Fail $_.Exception.Message
+    exit 1
+}
+
+# Phase 1: Collect
+Write-Info "--- Collect ---"
+$userProfile    = Get-UserProfile     -Upn $UserPrincipalName
+$signIn         = Get-SignInActivity  -Upn $UserPrincipalName -DaysBack $DaysBack
+$riskyUser      = Get-RiskyUserStatus -Upn $UserPrincipalName
+$authMethods    = Get-AuthMethods     -Upn $UserPrincipalName
+$mailboxConfig  = Get-MailboxConfig   -Upn $UserPrincipalName
+$inboxRules     = Get-InboxRules      -Upn $UserPrincipalName
+$auditEvents    = Get-MailboxAuditEvents    -Upn $UserPrincipalName -DaysBack $DaysBack
+$transportRules = Get-TransportRuleMatches  -Upn $UserPrincipalName
+
+# Phase 2: Analyze
+Write-Info "--- Analyze ---"
+$findings = Invoke-IocAnalysis `
+    -Upn             $UserPrincipalName `
+    -DaysBack        $DaysBack `
+    -UserProfile     $userProfile `
+    -SignIn          $signIn `
+    -RiskyUser       $riskyUser `
+    -AuthMethods     $authMethods `
+    -MailboxConfig   $mailboxConfig `
+    -InboxRules      $inboxRules `
+    -AuditEvents     $auditEvents `
+    -TransportRules  $transportRules
+
+$highCount   = @($findings | Where-Object { $_.Severity -eq 'High'   }).Count
+$medCount    = @($findings | Where-Object { $_.Severity -eq 'Medium' }).Count
+Write-Info "Findings: $($findings.Count) total | High: $highCount | Medium: $medCount"
+
+# Phase 3: Render
+Write-Info "--- Render ---"
+$html = ConvertTo-HtmlReport `
+    -Upn            $UserPrincipalName `
+    -DaysBack       $DaysBack `
+    -ScriptVersion  $ScriptVersion `
+    -Findings       $findings `
+    -UserProfile    $userProfile `
+    -SignIn         $signIn `
+    -RiskyUser      $riskyUser `
+    -AuthMethods    $authMethods `
+    -MailboxConfig  $mailboxConfig `
+    -InboxRules     $inboxRules `
+    -AuditEvents    $auditEvents `
+    -TransportRules $transportRules
+
+$resolvedPath = [System.IO.Path]::GetFullPath($OutputHtml)
+$outDir = [System.IO.Path]::GetDirectoryName($resolvedPath)
+if ($outDir -and -not (Test-Path $outDir)) {
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+}
+[System.IO.File]::WriteAllText($resolvedPath, $html, [System.Text.Encoding]::UTF8)
+Write-Done "Report written to $OutputHtml"
+
+if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+    Invoke-Item $OutputHtml
+}
