@@ -153,3 +153,26 @@ function Get-AuthMethods {
         return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = @() }
     }
 }
+
+function Get-SignInActivity {
+    param([string]$Upn, [int]$DaysBack)
+    Write-Step "Collecting sign-in logs (30-day window)..."
+    try {
+        $thirtyDaysAgo = (Get-Date).AddDays(-30).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $filter = "userPrincipalName eq '$Upn' and createdDateTime ge $thirtyDaysAgo"
+        $all = @(Get-MgAuditLogSignIn -Filter $filter -All -ErrorAction Stop)
+        $cutoff = (Get-Date).AddDays(-$DaysBack)
+        $inWindow = @($all | Where-Object { [datetime]$_.CreatedDateTime -ge $cutoff })
+        $baseline = @($all | Where-Object { [datetime]$_.CreatedDateTime -lt $cutoff })
+        Write-Done "Sign-ins: $($inWindow.Count) in window, $($baseline.Count) in baseline"
+        return [PSCustomObject]@{
+            Ok       = $true
+            All      = $all
+            InWindow = $inWindow
+            Baseline = $baseline
+        }
+    } catch {
+        Write-Fail "Get-SignInActivity failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; All = @(); InWindow = @(); Baseline = @() }
+    }
+}
