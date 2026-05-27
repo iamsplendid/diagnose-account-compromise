@@ -248,3 +248,147 @@ function Get-TransportRuleMatches {
         return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = @() }
     }
 }
+
+function Invoke-IocAnalysis {
+    param(
+        [string]$Upn,
+        [int]$DaysBack,
+        $UserProfile,
+        $SignIn,
+        $RiskyUser,
+        $AuthMethods,
+        $MailboxConfig,
+        $InboxRules,
+        $AuditEvents,
+        $TransportRules
+    )
+
+    $domain = ($Upn -split '@')[1]
+    $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    function Add-Finding {
+        param([string]$Severity, [string]$Category, [string]$Finding, [string]$Detail)
+        $findings.Add([PSCustomObject]@{
+            Severity = $Severity
+            Category = $Category
+            Finding  = $Finding
+            Detail   = $Detail
+        })
+    }
+
+    # --- Mailbox forwarding ---
+    if ($MailboxConfig.Ok -and $MailboxConfig.Data) {
+        $mb = $MailboxConfig.Data
+        if ($mb.ForwardingSmtpAddress) {
+            Add-Finding 'High' 'Forwarding' 'External SMTP forwarding configured' "ForwardingSmtpAddress: $($mb.ForwardingSmtpAddress)"
+        }
+        if ($mb.ForwardingAddress) {
+            Add-Finding 'Low' 'Forwarding' 'Internal forwarding configured' "ForwardingAddress: $($mb.ForwardingAddress)"
+        }
+        if ($mb.DeliverToMailboxAndForward -and ($mb.ForwardingSmtpAddress -or $mb.ForwardingAddress)) {
+            Add-Finding 'Low' 'Forwarding' 'DeliverToMailboxAndForward is enabled' 'Mail is copied to the forwarding address while also staying in the mailbox.'
+        }
+        if (-not $mb.AuditEnabled) {
+            Add-Finding 'Info' 'Identity' 'Mailbox auditing is disabled' 'AuditEnabled is false. The audit log collector will return no results for this mailbox.'
+        }
+    }
+
+    # --- Inbox rules ---
+    if ($InboxRules.Ok) {
+        foreach ($rule in @($InboxRules.Data | Where-Object { $_.Enabled })) {
+            $fwdTargets = @()
+            if ($rule.ForwardTo)            { $fwdTargets += @($rule.ForwardTo | ForEach-Object { $_.ToString() }) }
+            if ($rule.RedirectTo)           { $fwdTargets += @($rule.RedirectTo | ForEach-Object { $_.ToString() }) }
+            if ($rule.ForwardAsAttachmentTo){ $fwdTargets += @($rule.ForwardAsAttachmentTo | ForEach-Object { $_.ToString() }) }
+
+            if ($fwdTargets.Count -gt 0) {
+                Add-Finding 'High' 'InboxRule' "Rule '$($rule.Name)' forwards or redirects mail" "Targets: $($fwdTargets -join '; ')"
+            } elseif ($rule.DeleteMessage) {
+                Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' deletes matching messages" "Description: $($rule.Description)"
+            } elseif ($rule.MarkAsRead -and -not $fwdTargets) {
+                Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' silently marks messages as read" "Description: $($rule.Description)"
+            } elseif ($rule.MoveToFolder -and $rule.MoveToFolder -match 'Deleted') {
+                Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' moves messages to Deleted Items" "MoveToFolder: $($rule.MoveToFolder)"
+            }
+        }
+    }
+
+    # --- Sign-in risk ---
+    if ($SignIn.Ok) {
+        $highRisk = @($SignIn.InWindow | Where-Object {
+            $_.RiskLevelDuringSignIn -in @('high','medium') -or
+            $_.RiskLevelAggregated   -in @('high','medium')
+        })
+        if ($highRisk.Count -gt 0) {
+            $levels = ($highRisk | Select-Object -ExpandProperty RiskLevelDuringSignIn -Unique | Where-Object { $_ }) -join ', '
+            Add-Finding 'High' 'SignIn' "$($highRisk.Count) high/medium-risk sign-in(s) in lookback window" "Risk levels observed: $levels"
+        }
+
+        $baselineCountries = @($SignIn.Baseline |
+            Select-Object -ExpandProperty Location | Where-Object { $_ } |
+            ForEach-Object { $_.CountryOrRegion } | Where-Object { $_ } | Sort-Object -Unique)
+        $windowCountries = @($SignIn.InWindow |
+            Select-Object -ExpandProperty Location | Where-Object { $_ } |
+            ForEach-Object { $_.CountryOrRegion } | Where-Object { $_ } | Sort-Object -Unique)
+        $newCountries = @($windowCountries | Where-Object { $_ -and $_ -notin $baselineCountries })
+        if ($newCountries.Count -gt 0) {
+            Add-Finding 'Medium' 'SignIn' "Sign-in from new country/region: $($newCountries -join ', ')" 'This country/region had no sign-ins in the baseline window (prior 30 days).'
+        }
+    }
+
+    # --- Identity Protection ---
+    if ($RiskyUser.Ok -and $RiskyUser.Data) {
+        $ru = $RiskyUser.Data
+        if ($ru.RiskState -in @('atRisk','confirmedCompromised')) {
+            Add-Finding 'High' 'Identity' "Identity Protection risk state: '$($ru.RiskState)'" "Detail: $($ru.RiskDetail). Last updated: $($ru.RiskLastUpdatedDateTime)"
+        }
+    }
+
+    # --- Auth methods registered in window ---
+    if ($AuthMethods.Ok) {
+        $cutoff = (Get-Date).AddDays(-$DaysBack)
+        foreach ($m in @($AuthMethods.Data | Where-Object { $_.MethodType -ne 'password' })) {
+            if ($m.CreatedDateTime) {
+                try {
+                    $created = [datetime]$m.CreatedDateTime
+                    if ($created -ge $cutoff) {
+                        Add-Finding 'High' 'AuthMethod' "Auth method registered during lookback window: $($m.MethodType)" "Registered: $($m.CreatedDateTime). Display: $($m.DisplayName)$($m.PhoneNumber)"
+                    }
+                } catch { }
+            }
+        }
+    }
+
+    # --- Audit log ---
+    if ($AuditEvents.Ok) {
+        $suspicious = @($AuditEvents.Data | Where-Object {
+            $_.Operation -in @('HardDelete','MoveToDeletedItems','UpdateFolderPermissions','SendAs','SendOnBehalf') -and
+            $_.LogonType -in @('Admin','Delegate')
+        })
+        foreach ($ev in $suspicious) {
+            Add-Finding 'Medium' 'AuditLog' "$($ev.Operation) by $($ev.LogonType) ($($ev.LogonUserDisplayName))" "Time: $($ev.LastAccessed). Folder: $($ev.DestFolderPathName)"
+        }
+    }
+
+    # --- Transport rules ---
+    if ($TransportRules.Ok) {
+        foreach ($rule in @($TransportRules.Data)) {
+            $hasRedirectOrBcc = $rule.RedirectMessageTo -or $rule.BlindCopyTo -or $rule.CopyTo
+            if ($hasRedirectOrBcc) {
+                $dest = @()
+                if ($rule.RedirectMessageTo) { $dest += "Redirect: $($rule.RedirectMessageTo -join ', ')" }
+                if ($rule.BlindCopyTo)       { $dest += "BCC: $($rule.BlindCopyTo -join ', ')" }
+                if ($rule.CopyTo)            { $dest += "Copy: $($rule.CopyTo -join ', ')" }
+                Add-Finding 'Medium' 'TransportRule' "Transport rule '$($rule.Name)' redirects or BCCs this sender" ($dest -join '; ')
+            }
+        }
+    }
+
+    # --- Account disabled ---
+    if ($UserProfile.Ok -and $UserProfile.Data -and -not $UserProfile.Data.AccountEnabled) {
+        Add-Finding 'Info' 'Identity' 'Account is currently disabled' 'AccountEnabled is false. Post-incident remediation may have already occurred.'
+    }
+
+    $order = @{ High = 0; Medium = 1; Low = 2; Info = 3 }
+    return @($findings | Sort-Object { $order[$_.Severity] })
+}
