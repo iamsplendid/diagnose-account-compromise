@@ -101,3 +101,55 @@ function Assert-Sessions {
     }
     Write-Done "Sessions validated (EXO: $($exo[0].Organization), Graph: $($graph.Account))"
 }
+
+function Get-UserProfile {
+    param([string]$Upn)
+    Write-Step "Collecting user profile..."
+    try {
+        $props = 'id,displayName,userPrincipalName,accountEnabled,createdDateTime,lastPasswordChangeDateTime,onPremisesSyncEnabled'
+        $u = Get-MgUser -UserId $Upn -Property $props -ErrorAction Stop
+        Write-Done "User profile: $($u.DisplayName)"
+        return [PSCustomObject]@{ Ok = $true; Data = $u }
+    } catch {
+        Write-Fail "Get-UserProfile failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = $null }
+    }
+}
+
+function Get-RiskyUserStatus {
+    param([string]$Upn)
+    Write-Step "Collecting Identity Protection risky user status..."
+    try {
+        $r = Get-MgRiskyUser -Filter "userPrincipalName eq '$Upn'" -ErrorAction Stop
+        $first = $r | Select-Object -First 1
+        Write-Done "Risky user state: $(if ($first) { $first.RiskState } else { 'not found' })"
+        return [PSCustomObject]@{ Ok = $true; Data = $first }
+    } catch {
+        Write-Fail "Get-RiskyUserStatus failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = $null }
+    }
+}
+
+function Get-AuthMethods {
+    param([string]$Upn)
+    Write-Step "Collecting authentication methods..."
+    try {
+        $raw = Get-MgUserAuthenticationMethod -UserId $Upn -All -ErrorAction Stop
+        $parsed = @($raw | ForEach-Object {
+            $ap = $_.AdditionalProperties
+            $methodType = ($ap['@odata.type'] -replace '#microsoft.graph.', '') -replace 'AuthenticationMethod', ''
+            [PSCustomObject]@{
+                Id              = $_.Id
+                MethodType      = $methodType
+                CreatedDateTime = $ap['createdDateTime']
+                DisplayName     = $ap['displayName']
+                PhoneNumber     = $ap['phoneNumber']
+            }
+        })
+        Write-Done "Auth methods: $($parsed.Count) found"
+        return [PSCustomObject]@{ Ok = $true; Data = $parsed }
+    } catch {
+        Write-Fail "Get-AuthMethods failed: $($_.Exception.Message)"
+        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = @() }
+    }
+}
