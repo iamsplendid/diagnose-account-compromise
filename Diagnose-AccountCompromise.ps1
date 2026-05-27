@@ -392,3 +392,245 @@ function Invoke-IocAnalysis {
     $order = @{ High = 0; Medium = 1; Low = 2; Info = 3 }
     return @($findings | Sort-Object { $order[$_.Severity] })
 }
+
+function ConvertTo-HtmlReport {
+    param(
+        [string]$Upn,
+        [int]$DaysBack,
+        [string]$ScriptVersion,
+        $Findings,
+        $UserProfile,
+        $SignIn,
+        $RiskyUser,
+        $AuthMethods,
+        $MailboxConfig,
+        $InboxRules,
+        $AuditEvents,
+        $TransportRules
+    )
+
+    $displayName = if ($UserProfile.Ok -and $UserProfile.Data) { $UserProfile.Data.DisplayName } else { $Upn }
+    $generated   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
+
+    function Sev-Badge { param([string]$s)
+        $cls = switch ($s) { 'High'{'sev-high'} 'Medium'{'sev-medium'} 'Low'{'sev-low'} default{'sev-info'} }
+        "<span class='badge $cls'>$s</span>"
+    }
+    function Err-Row { param([string]$msg, [int]$cols)
+        "<tr><td colspan='$cols' class='err'>Collector error: $msg</td></tr>"
+    }
+    function No-Data { param([int]$cols, [string]$msg = 'No data found.')
+        "<tr><td colspan='$cols' class='muted'>$msg</td></tr>"
+    }
+
+    # IOC Summary
+    $summaryRows = if ($Findings.Count -gt 0) {
+        ($Findings | ForEach-Object {
+            "<tr><td>$(Sev-Badge $_.Severity)</td><td>$($_.Category)</td><td>$($_.Finding)</td><td>$($_.Detail)</td></tr>"
+        }) -join "`n"
+    } else { No-Data 4 'No indicators of compromise identified.' }
+
+    # Sign-in rows
+    $signInRows = if (-not $SignIn.Ok) {
+        Err-Row $SignIn.Error 6
+    } elseif ($SignIn.InWindow.Count -eq 0) {
+        No-Data 6 'No sign-ins in the lookback window.'
+    } else {
+        ($SignIn.InWindow | Sort-Object CreatedDateTime -Descending | ForEach-Object {
+            $risk = if ($_.RiskLevelDuringSignIn) { $_.RiskLevelDuringSignIn } else { 'none' }
+            $rowStyle = if ($risk -in @('high','medium')) { " style='background:#fff1f2;'" } else { '' }
+            $loc = if ($_.Location) { "$($_.Location.City), $($_.Location.CountryOrRegion)" } else { '' }
+            "<tr$rowStyle><td>$($_.CreatedDateTime)</td><td>$($_.IpAddress)</td><td>$loc</td><td>$($_.AppDisplayName)</td><td>$($_.ConditionalAccessStatus)</td><td>$risk</td></tr>"
+        }) -join "`n"
+    }
+
+    # Identity Protection
+    $idpContent = if (-not $RiskyUser.Ok) {
+        "<div class='err'>Collector error: $($RiskyUser.Error)</div>"
+    } elseif (-not $RiskyUser.Data) {
+        "<div class='muted'>User not found in Identity Protection risky users list.</div>"
+    } else {
+        $ru = $RiskyUser.Data
+        $badge = if ($ru.RiskState -in @('atRisk','confirmedCompromised')) { Sev-Badge 'High' } else { Sev-Badge 'Info' }
+        "<table><tr><th>Risk State</th><th>Risk Detail</th><th>Risk Level</th><th>Last Updated</th></tr>
+        <tr><td>$badge $($ru.RiskState)</td><td>$($ru.RiskDetail)</td><td>$($ru.RiskLevel)</td><td>$($ru.RiskLastUpdatedDateTime)</td></tr></table>"
+    }
+
+    # Mailbox config
+    $mbContent = if (-not $MailboxConfig.Ok) {
+        "<div class='err'>Collector error: $($MailboxConfig.Error)</div>"
+    } else {
+        $mb = $MailboxConfig.Data
+        "<table><tr><th>Property</th><th>Value</th></tr>
+        <tr><td>ForwardingSmtpAddress</td><td>$(if ($mb.ForwardingSmtpAddress) { "<strong style='color:#991b1b;'>$($mb.ForwardingSmtpAddress)</strong>" } else { '<span class=''muted''>not set</span>' })</td></tr>
+        <tr><td>ForwardingAddress</td><td>$(if ($mb.ForwardingAddress) { $mb.ForwardingAddress } else { '<span class=''muted''>not set</span>' })</td></tr>
+        <tr><td>DeliverToMailboxAndForward</td><td>$($mb.DeliverToMailboxAndForward)</td></tr>
+        <tr><td>HiddenFromAddressListsEnabled</td><td>$($mb.HiddenFromAddressListsEnabled)</td></tr>
+        <tr><td>AuditEnabled</td><td>$(if (-not $mb.AuditEnabled) { "<strong style='color:#991b1b;'>False</strong>" } else { 'True' })</td></tr>
+        <tr><td>RecipientTypeDetails</td><td>$($mb.RecipientTypeDetails)</td></tr></table>"
+    }
+
+    # Inbox rules
+    $ruleRows = if (-not $InboxRules.Ok) {
+        Err-Row $InboxRules.Error 5
+    } elseif ($InboxRules.Data.Count -eq 0) {
+        No-Data 5 'No inbox rules found.'
+    } else {
+        ($InboxRules.Data | ForEach-Object {
+            $hasFwd = $_.ForwardTo -or $_.RedirectTo -or $_.ForwardAsAttachmentTo
+            $rowStyle = if ($hasFwd -or $_.DeleteMessage) { " style='background:#fff7ed;'" } else { '' }
+            $actions = @()
+            if ($_.ForwardTo)            { $actions += "Forward: $($_.ForwardTo -join ', ')" }
+            if ($_.RedirectTo)           { $actions += "Redirect: $($_.RedirectTo -join ', ')" }
+            if ($_.ForwardAsAttachmentTo){ $actions += "FwdAttachment: $($_.ForwardAsAttachmentTo -join ', ')" }
+            if ($_.DeleteMessage)        { $actions += "Delete" }
+            if ($_.MarkAsRead)           { $actions += "MarkAsRead" }
+            if ($_.MoveToFolder)         { $actions += "Move: $($_.MoveToFolder)" }
+            "<tr$rowStyle><td>$($_.Name)</td><td>$($_.Enabled)</td><td>$($_.Priority)</td><td>$($_.Description)</td><td>$($actions -join '; ')</td></tr>"
+        }) -join "`n"
+    }
+
+    # Auth methods
+    $authRows = if (-not $AuthMethods.Ok) {
+        Err-Row $AuthMethods.Error 4
+    } elseif ($AuthMethods.Data.Count -eq 0) {
+        No-Data 4 'No authentication methods found.'
+    } else {
+        $cutoff = (Get-Date).AddDays(-$DaysBack)
+        ($AuthMethods.Data | ForEach-Object {
+            $isNew = $false
+            if ($_.CreatedDateTime) { try { $isNew = ([datetime]$_.CreatedDateTime) -ge $cutoff } catch {} }
+            $rowStyle = if ($isNew) { " style='background:#fff1f2;'" } else { '' }
+            $cd = if ($_.CreatedDateTime) { $_.CreatedDateTime } else { '<span class=''muted''>n/a</span>' }
+            "<tr$rowStyle><td>$($_.MethodType)</td><td>$cd</td><td>$(if ($_.DisplayName) {$_.DisplayName} elseif ($_.PhoneNumber) {$_.PhoneNumber} else {''})</td><td>$(if ($isNew) { Sev-Badge 'High' } else { '' })</td></tr>"
+        }) -join "`n"
+    }
+
+    # Audit events
+    $auditRows = if (-not $AuditEvents.Ok) {
+        Err-Row $AuditEvents.Error 5
+    } elseif ($AuditEvents.Data.Count -eq 0) {
+        No-Data 5 'No matching audit events found in the lookback window.'
+    } else {
+        ($AuditEvents.Data | Sort-Object LastAccessed -Descending | ForEach-Object {
+            $isSusp = $_.LogonType -in @('Admin','Delegate') -and $_.Operation -in @('HardDelete','UpdateFolderPermissions','SendAs','SendOnBehalf')
+            $rowStyle = if ($isSusp) { " style='background:#fff1f2;'" } else { '' }
+            "<tr$rowStyle><td>$($_.LastAccessed)</td><td>$($_.Operation)</td><td>$($_.LogonType)</td><td>$($_.LogonUserDisplayName)</td><td>$($_.DestFolderPathName)</td></tr>"
+        }) -join "`n"
+    }
+
+    # Transport rules
+    $transportRows = if (-not $TransportRules.Ok) {
+        Err-Row $TransportRules.Error 4
+    } elseif ($TransportRules.Data.Count -eq 0) {
+        No-Data 4 'No transport rules match this sender.'
+    } else {
+        ($TransportRules.Data | ForEach-Object {
+            $actions = @()
+            if ($_.RedirectMessageTo) { $actions += "Redirect: $($_.RedirectMessageTo -join ', ')" }
+            if ($_.BlindCopyTo)       { $actions += "BCC: $($_.BlindCopyTo -join ', ')" }
+            if ($_.CopyTo)            { $actions += "Copy: $($_.CopyTo -join ', ')" }
+            if ($_.DeleteMessage)     { $actions += "Delete" }
+            if ($_.RejectMessageWith) { $actions += "Reject" }
+            "<tr><td>$($_.Name)</td><td>$($_.State)</td><td>$($_.Priority)</td><td>$($actions -join '; ')</td></tr>"
+        }) -join "`n"
+    }
+
+    # User profile summary
+    $upData = if ($UserProfile.Ok -and $UserProfile.Data) {
+        $u = $UserProfile.Data
+        "<table><tr><th>Property</th><th>Value</th></tr>
+        <tr><td>Display Name</td><td>$($u.DisplayName)</td></tr>
+        <tr><td>UPN</td><td>$($u.UserPrincipalName)</td></tr>
+        <tr><td>Account Enabled</td><td>$(if (-not $u.AccountEnabled) { "<strong style='color:#991b1b;'>False</strong>" } else { 'True' })</td></tr>
+        <tr><td>Created</td><td>$($u.CreatedDateTime)</td></tr>
+        <tr><td>Last Password Change</td><td>$($u.LastPasswordChangeDateTime)</td></tr>
+        <tr><td>On-Premises Sync</td><td>$($u.OnPremisesSyncEnabled)</td></tr></table>"
+    } else {
+        "<div class='err'>Collector error: $($UserProfile.Error)</div>"
+    }
+
+    return @"
+<!doctype html>
+<html><head><meta charset="utf-8"/><title>Account Compromise Report - $displayName</title>
+<style>
+body { font-family: Arial, sans-serif; margin:20px; background:#f7f9fb; color:#111827; }
+h1 { margin-bottom:4px; }
+.card { background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:14px; box-shadow:0 4px 12px rgba(0,0,0,0.05); margin-bottom:12px; }
+.card h2 { margin:0 0 8px 0; font-size:18px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th, td { padding:8px 10px; border-bottom:1px solid #edf0f5; text-align:left; vertical-align:top; }
+th { background:#eef3fb; font-weight:700; }
+.badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid transparent; font-weight:600; }
+.sev-high   { background:#fee2e2; color:#991b1b; border-color:#fecdd3; }
+.sev-medium { background:#fef3c7; color:#854d0e; border-color:#fde68a; }
+.sev-low    { background:#dbeafe; color:#1e3a8a; border-color:#93c5fd; }
+.sev-info   { background:#f3f4f6; color:#374151; border-color:#d1d5db; }
+.muted { color:#6b7280; font-size:12px; }
+.err   { color:#991b1b; font-style:italic; font-size:13px; }
+</style></head><body>
+  <h1>Account Compromise Report</h1>
+  <div class="muted">User: <strong>$displayName</strong> ($Upn) &nbsp;|&nbsp; Lookback: ${DaysBack}d &nbsp;|&nbsp; Generated: $generated &nbsp;|&nbsp; Script v$ScriptVersion</div>
+
+  <div class="card">
+    <h2>IOC Summary</h2>
+    <table><tr><th>Severity</th><th>Category</th><th>Finding</th><th>Detail</th></tr>
+    $summaryRows
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>User Profile</h2>
+    $upData
+  </div>
+
+  <div class="card">
+    <h2>Sign-In Activity (last ${DaysBack} days)</h2>
+    <div class="muted" style="margin-bottom:6px;">$(if ($SignIn.Ok) { "Showing $($SignIn.InWindow.Count) sign-in(s). Baseline (days $DaysBack-30): $($SignIn.Baseline.Count) sign-in(s)." })</div>
+    <table><tr><th>Timestamp</th><th>IP</th><th>Location</th><th>App</th><th>CA Status</th><th>Risk Level</th></tr>
+    $signInRows
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Identity Protection</h2>
+    $idpContent
+  </div>
+
+  <div class="card">
+    <h2>Mailbox Configuration</h2>
+    $mbContent
+  </div>
+
+  <div class="card">
+    <h2>Inbox Rules</h2>
+    <table><tr><th>Name</th><th>Enabled</th><th>Priority</th><th>Description</th><th>Actions</th></tr>
+    $ruleRows
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Authentication Methods</h2>
+    <div class="muted" style="margin-bottom:6px;">Methods registered within the lookback window are highlighted.</div>
+    <table><tr><th>Method Type</th><th>Registered</th><th>Display / Phone</th><th>Flag</th></tr>
+    $authRows
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Mailbox Audit Log (last ${DaysBack} days)</h2>
+    <table><tr><th>Timestamp</th><th>Operation</th><th>Logon Type</th><th>Performed By</th><th>Folder / Object</th></tr>
+    $auditRows
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Transport Rules (matching this sender)</h2>
+    <table><tr><th>Name</th><th>State</th><th>Priority</th><th>Actions</th></tr>
+    $transportRows
+    </table>
+  </div>
+
+</body></html>
+"@
+}
