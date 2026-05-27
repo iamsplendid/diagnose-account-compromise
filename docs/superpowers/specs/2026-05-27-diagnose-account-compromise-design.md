@@ -47,13 +47,13 @@ Eight collector functions, each returning a raw object or array. All errors are 
 | Function | Source | Data pulled |
 |---|---|---|
 | `Get-UserProfile` | Graph `/users/{upn}` | DisplayName, UPN, AccountEnabled, CreatedDateTime, LastPasswordChangeDateTime, OnPremisesSyncEnabled |
-| `Get-SignInActivity` | Graph `/auditLogs/signIns` | All sign-ins in window: timestamp, IP, location, app, CA result, risk level, risk detail |
+| `Get-SignInActivity` | Graph `/auditLogs/signIns` | Always fetches the full 30-day sign-in retention window; DaysBack determines the "investigation" sub-window vs. the baseline for country comparison |
 | `Get-RiskyUserStatus` | Graph `/identityProtection/riskyUsers` | Current risk state, risk detail, risk last updated |
-| `Get-AuthMethods` | Graph `/users/{upn}/authentication/methods` | All registered auth methods with type and registration timestamp |
+| `Get-AuthMethods` | Graph `/users/{upn}/authentication/methods` | All registered auth methods with type and registration timestamp (Note: `createdDateTime` is available for Authenticator app, phone, and TOTP methods but not for the built-in password method) |
 | `Get-MailboxConfig` | EXO `Get-Mailbox` | ForwardingAddress, ForwardingSmtpAddress, DeliverToMailboxAndForward, HiddenFromAddressListsEnabled, AuditEnabled |
 | `Get-InboxRules` | EXO `Get-InboxRule` | All rules: name, enabled state, conditions, actions (ForwardTo, RedirectTo, DeleteMessage, MarkAsRead, MoveToFolder) |
 | `Get-MailboxAuditEvents` | EXO `Search-MailboxAuditLog` | Operations in window for admin/delegate/owner: SendAs, SendOnBehalf, HardDelete, MoveToDeletedItems, UpdateFolderPermissions |
-| `Get-TransportRuleMatches` | EXO `Get-TransportRule` | Tenant transport rules whose From/SenderDomain conditions include this user or their domain |
+| `Get-TransportRuleMatches` | EXO `Get-TransportRule` | Tenant transport rules whose From/SenderDomain conditions match the exact UPN or the domain portion of the UPN (e.g., contoso.com for user@contoso.com) |
 
 ### Phase 2 — Analyze
 
@@ -78,7 +78,7 @@ Scoring rules:
 | Sign-in with High or Medium risk level | High |
 | MFA auth method registered within the lookback window | High |
 | Inbox rule deletes or marks-as-read without forwarding | Medium |
-| Sign-in from a country not seen in prior sign-in history | Medium |
+| Sign-in (within lookback window) from a country with no sign-ins in the preceding baseline window (up to 30 days before the investigation window) | Medium |
 | Audit log shows HardDelete or MoveToDeletedItems by delegate or admin | Medium |
 | Transport rule affects this sender with redirect or BCC | Medium |
 | `ForwardingAddress` set to internal mailbox | Low |
