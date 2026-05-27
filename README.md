@@ -12,7 +12,7 @@ Read-only PowerShell investigation tool for potentially compromised Office 365 a
 Connect first, then run:
 
     Connect-ExchangeOnline
-    Connect-MgGraph -Scopes "AuditLog.Read.All", "Directory.Read.All", "UserAuthenticationMethod.Read.All"
+    Connect-MgGraph -Scopes "AuditLog.Read.All", "Directory.Read.All", "UserAuthenticationMethod.Read.All", "IdentityRiskyUser.Read.All"
 
     .\Diagnose-AccountCompromise.ps1 -UserPrincipalName user@contoso.com
     .\Diagnose-AccountCompromise.ps1 -UserPrincipalName user@contoso.com -DaysBack 14
@@ -25,7 +25,7 @@ Connect first, then run:
 | `-UserPrincipalName` | (required) | UPN of the account to investigate |
 | `-DaysBack` | 7 | Lookback window in days for all time-based queries |
 | `-OutputHtml` | `.\AccountCompromise-<UPN>-<date>.html` | Output path for HTML report |
-| `-SkipUpdateCheck` | false | Skip the GitHub auto-update check |
+| `-SkipUpdateCheck` | (switch) | Skip the GitHub auto-update check |
 
 ## What It Checks
 
