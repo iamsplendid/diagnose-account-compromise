@@ -81,3 +81,23 @@ function Write-Warn { param([string]$m) Write-Warning $m }
 function Write-Step { param([string]$m) Write-Host "[....] $m" -ForegroundColor Gray }
 function Write-Done { param([string]$m) Write-Host "[ OK ] $m" -ForegroundColor Green }
 function Write-Fail { param([string]$m) Write-Host "[FAIL] $m" -ForegroundColor Red }
+
+function Assert-Sessions {
+    $exo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+    if (-not ($exo | Where-Object { $_.State -eq 'Connected' })) {
+        throw "No active Exchange Online session.`nRun: Connect-ExchangeOnline"
+    }
+
+    $graph = Get-MgContext -ErrorAction SilentlyContinue
+    if (-not $graph) {
+        throw "No active Graph session.`nRun: Connect-MgGraph -Scopes 'AuditLog.Read.All','Directory.Read.All','UserAuthenticationMethod.Read.All','IdentityRiskyUser.Read.All'"
+    }
+
+    $required = @('AuditLog.Read.All', 'Directory.Read.All', 'UserAuthenticationMethod.Read.All', 'IdentityRiskyUser.Read.All')
+    foreach ($scope in $required) {
+        if ($graph.Scopes -notcontains $scope) {
+            Write-Warn "Graph scope '$scope' not present. Some collectors may fail."
+        }
+    }
+    Write-Done "Sessions validated (EXO: $($exo[0].Organization), Graph: $($graph.Account))"
+}
