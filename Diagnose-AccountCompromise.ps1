@@ -16,7 +16,7 @@
 .PARAMETER UserPrincipalName
     The UPN of the account to investigate (e.g. user@contoso.com).
 .PARAMETER DaysBack
-    Lookback window in days for all time-based queries. Default: 7.
+    Lookback window in days. Default: 7. Applies to mailbox audit log and the investigation window for sign-in analysis. Sign-in logs always pull 30 days to enable baseline country comparison.
 .PARAMETER OutputHtml
     Path for the HTML report. Default: .\AccountCompromise-<UPN>-<yyyyMMdd>.html
 .PARAMETER SkipUpdateCheck
@@ -120,7 +120,8 @@ function Get-RiskyUserStatus {
     param([string]$Upn)
     Write-Step "Collecting Identity Protection risky user status..."
     try {
-        $r = Get-MgRiskyUser -Filter "userPrincipalName eq '$Upn'" -ErrorAction Stop
+        $escapedUpn = $Upn -replace "'", "''"
+        $r = Get-MgRiskyUser -Filter "userPrincipalName eq '$escapedUpn'" -ErrorAction Stop
         $first = $r | Select-Object -First 1
         Write-Done "Risky user state: $(if ($first) { $first.RiskState } else { 'not found' })"
         return [PSCustomObject]@{ Ok = $true; Data = $first }
@@ -159,7 +160,8 @@ function Get-SignInActivity {
     Write-Step "Collecting sign-in logs (30-day window)..."
     try {
         $thirtyDaysAgo = (Get-Date).AddDays(-30).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        $filter = "userPrincipalName eq '$Upn' and createdDateTime ge $thirtyDaysAgo"
+        $escapedUpn = $Upn -replace "'", "''"
+        $filter = "userPrincipalName eq '$escapedUpn' and createdDateTime ge $thirtyDaysAgo"
         $all = @(Get-MgAuditLogSignIn -Filter $filter -All -ErrorAction Stop)
         $cutoff = (Get-Date).AddDays(-$DaysBack)
         $inWindow = @($all | Where-Object { [datetime]$_.CreatedDateTime -ge $cutoff })
@@ -422,11 +424,12 @@ function ConvertTo-HtmlReport {
     function No-Data { param([int]$cols, [string]$msg = 'No data found.')
         "<tr><td colspan='$cols' class='muted'>$msg</td></tr>"
     }
+    function HtmlEncode { param([string]$s) if ($null -eq $s) { return '' }; [System.Net.WebUtility]::HtmlEncode($s) }
 
     # IOC Summary
     $summaryRows = if ($Findings.Count -gt 0) {
         ($Findings | ForEach-Object {
-            "<tr><td>$(Sev-Badge $_.Severity)</td><td>$($_.Category)</td><td>$($_.Finding)</td><td>$($_.Detail)</td></tr>"
+            "<tr><td>$(Sev-Badge $_.Severity)</td><td>$(HtmlEncode $_.Category)</td><td>$(HtmlEncode $_.Finding)</td><td>$(HtmlEncode $_.Detail)</td></tr>"
         }) -join "`n"
     } else { No-Data 4 'No indicators of compromise identified.' }
 
@@ -439,8 +442,8 @@ function ConvertTo-HtmlReport {
         ($SignIn.InWindow | Sort-Object CreatedDateTime -Descending | ForEach-Object {
             $risk = if ($_.RiskLevelDuringSignIn) { $_.RiskLevelDuringSignIn } else { 'none' }
             $rowStyle = if ($risk -in @('high','medium')) { " style='background:#fff1f2;'" } else { '' }
-            $loc = if ($_.Location) { "$($_.Location.City), $($_.Location.CountryOrRegion)" } else { '' }
-            "<tr$rowStyle><td>$($_.CreatedDateTime)</td><td>$($_.IpAddress)</td><td>$loc</td><td>$($_.AppDisplayName)</td><td>$($_.ConditionalAccessStatus)</td><td>$risk</td></tr>"
+            $loc = if ($_.Location) { "$(HtmlEncode $_.Location.City), $(HtmlEncode $_.Location.CountryOrRegion)" } else { '' }
+            "<tr$rowStyle><td>$($_.CreatedDateTime)</td><td>$(HtmlEncode $_.IpAddress)</td><td>$loc</td><td>$(HtmlEncode $_.AppDisplayName)</td><td>$(HtmlEncode $_.ConditionalAccessStatus)</td><td>$risk</td></tr>"
         }) -join "`n"
     }
 
@@ -453,7 +456,7 @@ function ConvertTo-HtmlReport {
         $ru = $RiskyUser.Data
         $badge = if ($ru.RiskState -in @('atRisk','confirmedCompromised')) { Sev-Badge 'High' } else { Sev-Badge 'Info' }
         "<table><tr><th>Risk State</th><th>Risk Detail</th><th>Risk Level</th><th>Last Updated</th></tr>
-        <tr><td>$badge $($ru.RiskState)</td><td>$($ru.RiskDetail)</td><td>$($ru.RiskLevel)</td><td>$($ru.RiskLastUpdatedDateTime)</td></tr></table>"
+        <tr><td>$badge $(HtmlEncode $ru.RiskState)</td><td>$(HtmlEncode $ru.RiskDetail)</td><td>$(HtmlEncode $ru.RiskLevel)</td><td>$(HtmlEncode $ru.RiskLastUpdatedDateTime)</td></tr></table>"
     }
 
     # Mailbox config
@@ -462,12 +465,12 @@ function ConvertTo-HtmlReport {
     } else {
         $mb = $MailboxConfig.Data
         "<table><tr><th>Property</th><th>Value</th></tr>
-        <tr><td>ForwardingSmtpAddress</td><td>$(if ($mb.ForwardingSmtpAddress) { "<strong style='color:#991b1b;'>$($mb.ForwardingSmtpAddress)</strong>" } else { '<span class=''muted''>not set</span>' })</td></tr>
-        <tr><td>ForwardingAddress</td><td>$(if ($mb.ForwardingAddress) { $mb.ForwardingAddress } else { '<span class=''muted''>not set</span>' })</td></tr>
-        <tr><td>DeliverToMailboxAndForward</td><td>$($mb.DeliverToMailboxAndForward)</td></tr>
-        <tr><td>HiddenFromAddressListsEnabled</td><td>$($mb.HiddenFromAddressListsEnabled)</td></tr>
+        <tr><td>ForwardingSmtpAddress</td><td>$(if ($mb.ForwardingSmtpAddress) { "<strong style='color:#991b1b;'>$(HtmlEncode $mb.ForwardingSmtpAddress)</strong>" } else { '<span class=''muted''>not set</span>' })</td></tr>
+        <tr><td>ForwardingAddress</td><td>$(if ($mb.ForwardingAddress) { HtmlEncode($mb.ForwardingAddress) } else { '<span class=''muted''>not set</span>' })</td></tr>
+        <tr><td>DeliverToMailboxAndForward</td><td>$(HtmlEncode $mb.DeliverToMailboxAndForward)</td></tr>
+        <tr><td>HiddenFromAddressListsEnabled</td><td>$(HtmlEncode $mb.HiddenFromAddressListsEnabled)</td></tr>
         <tr><td>AuditEnabled</td><td>$(if (-not $mb.AuditEnabled) { "<strong style='color:#991b1b;'>False</strong>" } else { 'True' })</td></tr>
-        <tr><td>RecipientTypeDetails</td><td>$($mb.RecipientTypeDetails)</td></tr></table>"
+        <tr><td>RecipientTypeDetails</td><td>$(HtmlEncode $mb.RecipientTypeDetails)</td></tr></table>"
     }
 
     # Inbox rules
@@ -486,7 +489,7 @@ function ConvertTo-HtmlReport {
             if ($_.DeleteMessage)        { $actions += "Delete" }
             if ($_.MarkAsRead)           { $actions += "MarkAsRead" }
             if ($_.MoveToFolder)         { $actions += "Move: $($_.MoveToFolder)" }
-            "<tr$rowStyle><td>$($_.Name)</td><td>$($_.Enabled)</td><td>$($_.Priority)</td><td>$($_.Description)</td><td>$($actions -join '; ')</td></tr>"
+            "<tr$rowStyle><td>$(HtmlEncode $_.Name)</td><td>$(HtmlEncode $_.Enabled)</td><td>$(HtmlEncode $_.Priority)</td><td>$(HtmlEncode $_.Description)</td><td>$(HtmlEncode ($actions -join '; '))</td></tr>"
         }) -join "`n"
     }
 
@@ -501,8 +504,8 @@ function ConvertTo-HtmlReport {
             $isNew = $false
             if ($_.CreatedDateTime) { try { $isNew = ([datetime]$_.CreatedDateTime) -ge $cutoff } catch {} }
             $rowStyle = if ($isNew) { " style='background:#fff1f2;'" } else { '' }
-            $cd = if ($_.CreatedDateTime) { $_.CreatedDateTime } else { '<span class=''muted''>n/a</span>' }
-            "<tr$rowStyle><td>$($_.MethodType)</td><td>$cd</td><td>$(if ($_.DisplayName) {$_.DisplayName} elseif ($_.PhoneNumber) {$_.PhoneNumber} else {''})</td><td>$(if ($isNew) { Sev-Badge 'High' } else { '' })</td></tr>"
+            $cd = if ($_.CreatedDateTime) { HtmlEncode($_.CreatedDateTime) } else { '<span class=''muted''>n/a</span>' }
+            "<tr$rowStyle><td>$(HtmlEncode $_.MethodType)</td><td>$cd</td><td>$(HtmlEncode (if ($_.DisplayName) {$_.DisplayName} elseif ($_.PhoneNumber) {$_.PhoneNumber} else {''}))</td><td>$(if ($isNew) { Sev-Badge 'High' } else { '' })</td></tr>"
         }) -join "`n"
     }
 
@@ -515,7 +518,7 @@ function ConvertTo-HtmlReport {
         ($AuditEvents.Data | Sort-Object LastAccessed -Descending | ForEach-Object {
             $isSusp = $_.LogonType -in @('Admin','Delegate') -and $_.Operation -in @('HardDelete','UpdateFolderPermissions','SendAs','SendOnBehalf')
             $rowStyle = if ($isSusp) { " style='background:#fff1f2;'" } else { '' }
-            "<tr$rowStyle><td>$($_.LastAccessed)</td><td>$($_.Operation)</td><td>$($_.LogonType)</td><td>$($_.LogonUserDisplayName)</td><td>$($_.DestFolderPathName)</td></tr>"
+            "<tr$rowStyle><td>$(HtmlEncode $_.LastAccessed)</td><td>$(HtmlEncode $_.Operation)</td><td>$(HtmlEncode $_.LogonType)</td><td>$(HtmlEncode $_.LogonUserDisplayName)</td><td>$(HtmlEncode $_.DestFolderPathName)</td></tr>"
         }) -join "`n"
     }
 
@@ -532,7 +535,7 @@ function ConvertTo-HtmlReport {
             if ($_.CopyTo)            { $actions += "Copy: $($_.CopyTo -join ', ')" }
             if ($_.DeleteMessage)     { $actions += "Delete" }
             if ($_.RejectMessageWith) { $actions += "Reject" }
-            "<tr><td>$($_.Name)</td><td>$($_.State)</td><td>$($_.Priority)</td><td>$($actions -join '; ')</td></tr>"
+            "<tr><td>$(HtmlEncode $_.Name)</td><td>$(HtmlEncode $_.State)</td><td>$(HtmlEncode $_.Priority)</td><td>$(HtmlEncode ($actions -join '; '))</td></tr>"
         }) -join "`n"
     }
 
@@ -540,19 +543,19 @@ function ConvertTo-HtmlReport {
     $upData = if ($UserProfile.Ok -and $UserProfile.Data) {
         $u = $UserProfile.Data
         "<table><tr><th>Property</th><th>Value</th></tr>
-        <tr><td>Display Name</td><td>$($u.DisplayName)</td></tr>
-        <tr><td>UPN</td><td>$($u.UserPrincipalName)</td></tr>
+        <tr><td>Display Name</td><td>$(HtmlEncode $u.DisplayName)</td></tr>
+        <tr><td>UPN</td><td>$(HtmlEncode $u.UserPrincipalName)</td></tr>
         <tr><td>Account Enabled</td><td>$(if (-not $u.AccountEnabled) { "<strong style='color:#991b1b;'>False</strong>" } else { 'True' })</td></tr>
-        <tr><td>Created</td><td>$($u.CreatedDateTime)</td></tr>
-        <tr><td>Last Password Change</td><td>$($u.LastPasswordChangeDateTime)</td></tr>
-        <tr><td>On-Premises Sync</td><td>$($u.OnPremisesSyncEnabled)</td></tr></table>"
+        <tr><td>Created</td><td>$(HtmlEncode $u.CreatedDateTime)</td></tr>
+        <tr><td>Last Password Change</td><td>$(HtmlEncode $u.LastPasswordChangeDateTime)</td></tr>
+        <tr><td>On-Premises Sync</td><td>$(HtmlEncode $u.OnPremisesSyncEnabled)</td></tr></table>"
     } else {
         "<div class='err'>Collector error: $($UserProfile.Error)</div>"
     }
 
     return @"
 <!doctype html>
-<html><head><meta charset="utf-8"/><title>Account Compromise Report - $displayName</title>
+<html><head><meta charset="utf-8"/><title>Account Compromise Report - $(HtmlEncode $displayName)</title>
 <style>
 body { font-family: Arial, sans-serif; margin:20px; background:#f7f9fb; color:#111827; }
 h1 { margin-bottom:4px; }
@@ -570,7 +573,7 @@ th { background:#eef3fb; font-weight:700; }
 .err   { color:#991b1b; font-style:italic; font-size:13px; }
 </style></head><body>
   <h1>Account Compromise Report</h1>
-  <div class="muted">User: <strong>$displayName</strong> ($Upn) &nbsp;|&nbsp; Lookback: ${DaysBack}d &nbsp;|&nbsp; Generated: $generated &nbsp;|&nbsp; Script v$ScriptVersion</div>
+  <div class="muted">User: <strong>$(HtmlEncode $displayName)</strong> ($(HtmlEncode $Upn)) &nbsp;|&nbsp; Lookback: ${DaysBack}d &nbsp;|&nbsp; Generated: $generated &nbsp;|&nbsp; Script v$ScriptVersion</div>
 
   <div class="card">
     <h2>IOC Summary</h2>
