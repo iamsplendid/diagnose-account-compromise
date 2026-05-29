@@ -28,6 +28,7 @@
 .NOTES
     Requires: ExchangeOnlineManagement, Microsoft.Graph
     Graph scopes: AuditLog.Read.All, Directory.Read.All, UserAuthenticationMethod.Read.All, IdentityRiskyUser.Read.All
+    Identity Protection (risky user status) requires Entra ID P2 licensing. The collector skips gracefully if unlicensed.
 #>
 [CmdletBinding()]
 param(
@@ -73,7 +74,7 @@ if (-not $SkipUpdateCheck) {
 
 if (-not $OutputHtml) {
     $safeName = $UserPrincipalName -replace '[^a-zA-Z0-9@._-]', '_'
-    $OutputHtml = ".\AccountCompromise-$safeName-$(Get-Date -Format 'yyyyMMdd').html"
+    $OutputHtml = "C:\temp\reports\AccountCompromise-$safeName-$(Get-Date -Format 'yyyyMMdd').html"
 }
 
 function Write-Info { param([string]$m) Write-Host "[INFO] $m" -ForegroundColor Cyan }
@@ -126,8 +127,14 @@ function Get-RiskyUserStatus {
         Write-Done "Risky user state: $(if ($first) { $first.RiskState } else { 'not found' })"
         return [PSCustomObject]@{ Ok = $true; Data = $first }
     } catch {
-        Write-Fail "Get-RiskyUserStatus failed: $($_.Exception.Message)"
-        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; Data = $null }
+        $msg = $_.Exception.Message
+        $notLicensed = $msg -match 'Forbidden' -and $msg -match 'not licensed'
+        if ($notLicensed) {
+            Write-Warn "Get-RiskyUserStatus: tenant not licensed for Identity Protection (Entra ID P2 required). Skipping."
+        } else {
+            Write-Fail "Get-RiskyUserStatus failed: $msg"
+        }
+        return [PSCustomObject]@{ Ok = $false; NotLicensed = $notLicensed; Error = $msg; Data = $null }
     }
 }
 
@@ -219,11 +226,21 @@ function Get-MailboxAuditEvents {
     try {
         $start = (Get-Date).AddDays(-$DaysBack)
         $ops = @('SendAs','SendOnBehalf','HardDelete','MoveToDeletedItems','UpdateFolderPermissions')
-        $results = @(Search-MailboxAuditLog -Identity $Upn -StartDate $start -EndDate (Get-Date) `
-            -Operations $ops -LogonTypes Admin,Delegate,Owner -ResultSize 250000 -ErrorAction Stop)
-        if ($results.Count -ge 250000) {
-            Write-Warn "Mailbox audit result limit reached (250,000). Some events may be missing."
+        $raw = @(Search-UnifiedAuditLog -UserIds $Upn -StartDate $start -EndDate (Get-Date) `
+            -Operations $ops -ResultSize 5000 -ErrorAction Stop)
+        if ($raw.Count -ge 5000) {
+            Write-Warn "Mailbox audit result limit reached (5,000). Some events may be missing. Consider narrowing the lookback window."
         }
+        $results = @($raw | ForEach-Object {
+            $data = $_.AuditData | ConvertFrom-Json
+            [PSCustomObject]@{
+                LastAccessed         = $_.CreationDate
+                Operation            = $data.Operation
+                LogonType            = $data.LogonType
+                LogonUserDisplayName = if ($data.LogonUserDisplayName) { $data.LogonUserDisplayName } else { $data.UserId }
+                DestFolderPathName   = $data.DestFolderPathName
+            }
+        })
         Write-Done "Audit events: $($results.Count) found"
         return [PSCustomObject]@{ Ok = $true; Data = $results }
     } catch {
@@ -435,20 +452,106 @@ function ConvertTo-HtmlReport {
 
     # Sign-in rows
     $signInRows = if (-not $SignIn.Ok) {
-        Err-Row $SignIn.Error 6
+        Err-Row $SignIn.Error 7
     } elseif ($SignIn.InWindow.Count -eq 0) {
-        No-Data 6 'No sign-ins in the lookback window.'
+        No-Data 7 'No sign-ins in the lookback window.'
     } else {
         ($SignIn.InWindow | Sort-Object CreatedDateTime -Descending | ForEach-Object {
-            $risk = if ($_.RiskLevelDuringSignIn) { $_.RiskLevelDuringSignIn } else { 'none' }
-            $rowStyle = if ($risk -in @('high','medium')) { " style='background:#fff1f2;'" } else { '' }
+            $risk    = if ($_.RiskLevelDuringSignIn) { $_.RiskLevelDuringSignIn } else { 'none' }
+            $success = $_.Status -and $_.Status.ErrorCode -eq 0
+            $resultCell = if ($success) {
+                "<span style='color:#166534;font-weight:600;'>Success</span>"
+            } else {
+                $reason = if ($_.Status -and $_.Status.FailureReason) { HtmlEncode $_.Status.FailureReason } else { 'Failed' }
+                "<span style='color:#991b1b;font-weight:600;'>Failed</span> <span class='muted'>$reason</span>"
+            }
+            $rowStyle = if ($risk -in @('high','medium')) { " style='background:#fff1f2;'" }
+                        elseif (-not $success)            { " style='background:#fff7ed;'" }
+                        else                              { '' }
             $loc = if ($_.Location) { "$(HtmlEncode $_.Location.City), $(HtmlEncode $_.Location.CountryOrRegion)" } else { '' }
-            "<tr$rowStyle><td>$($_.CreatedDateTime)</td><td>$(HtmlEncode $_.IpAddress)</td><td>$loc</td><td>$(HtmlEncode $_.AppDisplayName)</td><td>$(HtmlEncode $_.ConditionalAccessStatus)</td><td>$risk</td></tr>"
+            "<tr$rowStyle><td>$($_.CreatedDateTime)</td><td>$(HtmlEncode $_.IpAddress)</td><td>$loc</td><td>$(HtmlEncode $_.AppDisplayName)</td><td>$(HtmlEncode $_.ConditionalAccessStatus)</td><td>$risk</td><td>$resultCell</td></tr>"
+        }) -join "`n"
+    }
+
+    # Sign-in profile summary
+    $profileRows = if (-not $SignIn.Ok -or $SignIn.All.Count -eq 0) {
+        No-Data 8 'No sign-in data available.'
+    } else {
+        $baseCountrySet = @($SignIn.Baseline |
+            ForEach-Object { if ($_.Location) { $_.Location.CountryOrRegion } } |
+            Where-Object { $_ } | Sort-Object -Unique)
+
+        $groups = $SignIn.All | Group-Object {
+            $c  = if ($_.Location -and $_.Location.CountryOrRegion) { $_.Location.CountryOrRegion } else { 'Unknown' }
+            $ap = if ($_.AppDisplayName) { $_.AppDisplayName } else { 'Unknown App' }
+            $os = if ($_.DeviceDetail -and $_.DeviceDetail.OperatingSystem) { $_.DeviceDetail.OperatingSystem }
+                  elseif ($_.ClientAppUsed) { $_.ClientAppUsed }
+                  else { 'Unknown' }
+            "$c|||$ap|||$os"
+        }
+
+        $profiles = @($groups | ForEach-Object {
+            $parts   = $_.Name -split '\|\|\|'
+            $entries = @($_.Group)
+            $country = $parts[0]
+
+            $isNewCountry = $country -notin @('Unknown', '') -and $country -notin $baseCountrySet
+            $hasRisk      = @($entries | Where-Object {
+                $_.RiskLevelDuringSignIn -in @('high','medium') -or
+                $_.RiskLevelAggregated   -in @('high','medium')
+            }).Count -gt 0
+            $isLegacy     = @($entries | Where-Object {
+                $_.ClientAppUsed -match 'SMTP|IMAP|POP|MAPI|ActiveSync|Other clients'
+            }).Count -gt 0
+            $uniqueIps    = @($entries | Select-Object -ExpandProperty IpAddress | Where-Object { $_ } | Sort-Object -Unique)
+            $lastSeen     = ($entries | Sort-Object CreatedDateTime -Descending | Select-Object -First 1).CreatedDateTime
+            $successCount = @($entries | Where-Object { $_.Status -and $_.Status.ErrorCode -eq 0 }).Count
+            $failCount    = $entries.Count - $successCount
+
+            $reasons = @()
+            if ($isNewCountry) { $reasons += 'New country' }
+            if ($hasRisk)      { $reasons += 'Risk detected' }
+            if ($isLegacy)     { $reasons += 'Legacy auth' }
+
+            [PSCustomObject]@{
+                Country      = $country
+                App          = $parts[1]
+                DeviceOS     = $parts[2]
+                Count        = $entries.Count
+                UniqueIPs    = $uniqueIps.Count
+                IpList       = $uniqueIps
+                LastSeen     = $lastSeen
+                SuccessCount = $successCount
+                FailCount    = $failCount
+                Reasons      = $reasons -join '; '
+            }
+        }) | Sort-Object { if ($_.Reasons -ne '') { 0 } else { 1 } }, { -$_.Count }
+
+        ($profiles | ForEach-Object {
+            $suspicious = $_.Reasons -ne ''
+            $hasFailures = $_.FailCount -gt 0
+            $rowStyle   = if ($suspicious)  { " style='background:#fff7ed;'" }
+                          elseif ($hasFailures) { " style='background:#fff7ed;'" }
+                          else                  { '' }
+            $sevClass    = if ($_.Reasons -match 'Risk') { 'High' } elseif ($suspicious) { 'Medium' } else { '' }
+            $rawFlagText = if ($suspicious) { $_.Reasons } else { '' }
+            $flagCell    = if ($suspicious) { "$(Sev-Badge $sevClass) $(HtmlEncode $rawFlagText)" } else { "<span class='muted'>clean</span>" }
+            $resultCell  = if ($_.FailCount -eq 0) {
+                "<span style='color:#166534;font-weight:600;'>$($_.SuccessCount) success</span>"
+            } elseif ($_.SuccessCount -eq 0) {
+                "<span style='color:#991b1b;font-weight:600;'>$($_.FailCount) failed</span>"
+            } else {
+                "<span style='color:#166534;font-weight:600;'>$($_.SuccessCount) success</span> / <span style='color:#991b1b;font-weight:600;'>$($_.FailCount) failed</span>"
+            }
+            $ipCell = ($_.IpList | ForEach-Object { HtmlEncode $_ }) -join '<br>'
+            "<tr$rowStyle><td>$(HtmlEncode $_.Country)</td><td>$(HtmlEncode $_.App)</td><td>$(HtmlEncode $_.DeviceOS)</td><td>$($_.Count)</td><td>$ipCell</td><td>$(HtmlEncode $_.LastSeen)</td><td>$resultCell</td><td>$flagCell</td></tr>"
         }) -join "`n"
     }
 
     # Identity Protection
-    $idpContent = if (-not $RiskyUser.Ok) {
+    $idpContent = if (-not $RiskyUser.Ok -and $RiskyUser.NotLicensed) {
+        "<div class='muted'>Identity Protection not available: tenant is not licensed for this feature (requires Entra ID P2).</div>"
+    } elseif (-not $RiskyUser.Ok) {
         "<div class='err'>Collector error: $($RiskyUser.Error)</div>"
     } elseif (-not $RiskyUser.Data) {
         "<div class='muted'>User not found in Identity Protection risky users list.</div>"
@@ -505,7 +608,9 @@ function ConvertTo-HtmlReport {
             if ($_.CreatedDateTime) { try { $isNew = ([datetime]$_.CreatedDateTime) -ge $cutoff } catch {} }
             $rowStyle = if ($isNew) { " style='background:#fff1f2;'" } else { '' }
             $cd = if ($_.CreatedDateTime) { HtmlEncode($_.CreatedDateTime) } else { '<span class=''muted''>n/a</span>' }
-            "<tr$rowStyle><td>$(HtmlEncode $_.MethodType)</td><td>$cd</td><td>$(HtmlEncode (if ($_.DisplayName) {$_.DisplayName} elseif ($_.PhoneNumber) {$_.PhoneNumber} else {''}))</td><td>$(if ($isNew) { Sev-Badge 'High' } else { '' })</td></tr>"
+            $rawDisp = if ($_.DisplayName) { $_.DisplayName } elseif ($_.PhoneNumber) { $_.PhoneNumber } else { '' }
+            $dispVal = HtmlEncode $rawDisp
+            "<tr$rowStyle><td>$(HtmlEncode $_.MethodType)</td><td>$cd</td><td>$dispVal</td><td>$(if ($isNew) { Sev-Badge 'High' } else { '' })</td></tr>"
         }) -join "`n"
     }
 
@@ -571,6 +676,14 @@ th { background:#eef3fb; font-weight:700; }
 .sev-info   { background:#f3f4f6; color:#374151; border-color:#d1d5db; }
 .muted { color:#6b7280; font-size:12px; }
 .err   { color:#991b1b; font-style:italic; font-size:13px; }
+.stat-block { display:flex; gap:12px; margin-bottom:10px; flex-wrap:wrap; }
+.stat-tile { flex:1; min-width:100px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:8px; padding:12px 16px; text-align:center; }
+.stat-tile .stat-val { font-size:28px; font-weight:700; line-height:1.1; color:#111827; }
+.stat-tile .stat-lbl { font-size:11px; color:#6b7280; margin-top:4px; text-transform:uppercase; letter-spacing:.05em; }
+.stat-tile.alert-red .stat-val, .stat-tile.alert-red .stat-lbl { color:#991b1b; }
+.stat-tile.alert-red { background:#fee2e2; border-color:#fecdd3; }
+.stat-tile.alert-orange .stat-val, .stat-tile.alert-orange .stat-lbl { color:#c2410c; }
+.stat-tile.alert-orange { background:#fff7ed; border-color:#fed7aa; }
 </style></head><body>
   <h1>Account Compromise Report</h1>
   <div class="muted">User: <strong>$(HtmlEncode $displayName)</strong> ($(HtmlEncode $Upn)) &nbsp;|&nbsp; Lookback: ${DaysBack}d &nbsp;|&nbsp; Generated: $generated &nbsp;|&nbsp; Script v$ScriptVersion</div>
@@ -583,6 +696,14 @@ th { background:#eef3fb; font-weight:700; }
   </div>
 
   <div class="card">
+    <h2>Sign-In Profile Summary (30 days)</h2>
+    <div class="muted" style="margin-bottom:6px;">One row per unique country / app / device combination across the full 30-day window. Suspicious profiles are highlighted. &ldquo;New country&rdquo; means no sign-ins from that country in the baseline period prior to the lookback window.</div>
+    <table><tr><th>Country</th><th>App</th><th>Device / OS</th><th>Sign-ins</th><th>IPs</th><th>Last Seen</th><th>Result</th><th>Flags</th></tr>
+    $profileRows
+    </table>
+  </div>
+
+  <div class="card">
     <h2>User Profile</h2>
     $upData
   </div>
@@ -590,7 +711,7 @@ th { background:#eef3fb; font-weight:700; }
   <div class="card">
     <h2>Sign-In Activity (last ${DaysBack} days)</h2>
     <div class="muted" style="margin-bottom:6px;">$(if ($SignIn.Ok) { "Showing $($SignIn.InWindow.Count) sign-in(s). Baseline (days $DaysBack-30): $($SignIn.Baseline.Count) sign-in(s)." })</div>
-    <table><tr><th>Timestamp</th><th>IP</th><th>Location</th><th>App</th><th>CA Status</th><th>Risk Level</th></tr>
+    <table><tr><th>Timestamp</th><th>IP</th><th>Location</th><th>App</th><th>CA Status</th><th>Risk Level</th><th>Result</th></tr>
     $signInRows
     </table>
   </div>
@@ -697,12 +818,16 @@ $html = ConvertTo-HtmlReport `
     -TransportRules $transportRules
 
 $resolvedPath = [System.IO.Path]::GetFullPath($OutputHtml)
+if ($resolvedPath.EndsWith('\') -or $resolvedPath.EndsWith('/') -or (Test-Path $resolvedPath -PathType Container)) {
+    $safeName = $UserPrincipalName -replace '[^a-zA-Z0-9@._-]', '_'
+    $resolvedPath = [System.IO.Path]::Combine($resolvedPath.TrimEnd('\', '/'), "AccountCompromise-$safeName-$(Get-Date -Format 'yyyyMMdd').html")
+}
 $outDir = [System.IO.Path]::GetDirectoryName($resolvedPath)
 if ($outDir -and -not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 }
 [System.IO.File]::WriteAllText($resolvedPath, $html, [System.Text.Encoding]::UTF8)
-Write-Done "Report written to $OutputHtml"
+Write-Done "Report written to $resolvedPath"
 
 if ($IsWindows -or $env:OS -eq 'Windows_NT') {
     Invoke-Item $OutputHtml
