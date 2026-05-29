@@ -313,6 +313,13 @@ function Invoke-IocAnalysis {
     }
 
     # --- Inbox rules ---
+    # Built-in folders attackers use as staging areas — users rarely open these
+    $suspiciousFolders = @('RSS Subscriptions', 'RSS Feeds', 'Deleted Items', 'Junk Email', 'Clutter', 'Sync Issues', 'Archive')
+    # Keywords attackers filter for to suppress detection emails and hide BEC activity
+    $securityKeywords  = @('phish', 'phishing', 'spam', 'suspicious', 'malware', 'virus', 'quarantine',
+                           'security alert', 'unusual sign', 'blocked', 'invoice', 'payment', 'wire transfer',
+                           'unusual activity', 'verify your', 'confirm your')
+
     if ($InboxRules.Ok) {
         foreach ($rule in @($InboxRules.Data | Where-Object { $_.Enabled })) {
             $fwdTargets = @()
@@ -320,14 +327,48 @@ function Invoke-IocAnalysis {
             if ($rule.RedirectTo)           { $fwdTargets += @($rule.RedirectTo | ForEach-Object { $_.ToString() }) }
             if ($rule.ForwardAsAttachmentTo){ $fwdTargets += @($rule.ForwardAsAttachmentTo | ForEach-Object { $_.ToString() }) }
 
+            $moveFolder       = $rule.MoveToFolder
+            $isObscureFolder  = $moveFolder -and ($suspiciousFolders -contains $moveFolder -or $moveFolder -eq 'Deleted Items')
+
+            # Forwarding / redirect — always high
             if ($fwdTargets.Count -gt 0) {
                 Add-Finding 'High' 'InboxRule' "Rule '$($rule.Name)' forwards or redirects mail" "Targets: $($fwdTargets -join '; ')"
-            } elseif ($rule.DeleteMessage) {
-                Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' deletes matching messages" "Description: $($rule.Description)"
-            } elseif ($rule.MarkAsRead -and -not $fwdTargets) {
+            }
+
+            # Delete — high (active evidence destruction)
+            if ($rule.DeleteMessage) {
+                Add-Finding 'High' 'InboxRule' "Rule '$($rule.Name)' deletes matching messages" "Description: $($rule.Description)"
+            }
+
+            # Move to obscure built-in folder — canonical BEC hiding pattern
+            if ($isObscureFolder) {
+                $detail = "MoveToFolder: $moveFolder"
+                if ($rule.MarkAsRead) { $detail += ' + MarkAsRead' }
+                Add-Finding 'High' 'InboxRule' "Rule '$($rule.Name)' moves mail to obscure folder '$moveFolder'" $detail
+            } elseif ($rule.MarkAsRead -and $moveFolder) {
+                # MarkAsRead + move to a named (non-built-in) folder — medium, but hides messages from user
+                Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' moves and silently marks messages as read" "MoveToFolder: $moveFolder"
+            } elseif ($rule.MarkAsRead -and -not $moveFolder) {
+                # MarkAsRead alone — medium
                 Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' silently marks messages as read" "Description: $($rule.Description)"
-            } elseif ($rule.MoveToFolder -and $rule.MoveToFolder -match 'Deleted') {
-                Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' moves messages to Deleted Items" "MoveToFolder: $($rule.MoveToFolder)"
+            }
+
+            # Security keyword filtering — suppressing detection/financial emails
+            $allKeywords = @()
+            if ($rule.SubjectContainsWords)       { $allKeywords += $rule.SubjectContainsWords }
+            if ($rule.SubjectOrBodyContainsWords)  { $allKeywords += $rule.SubjectOrBodyContainsWords }
+            if ($rule.BodyContainsWords)           { $allKeywords += $rule.BodyContainsWords }
+            $matchedKeywords = @($allKeywords | Where-Object {
+                $kw = $_
+                $securityKeywords | Where-Object { $kw -match $_ }
+            })
+            if ($matchedKeywords.Count -gt 0) {
+                Add-Finding 'High' 'InboxRule' "Rule '$($rule.Name)' targets security or financial keywords" "Keywords: $($matchedKeywords -join ', ')"
+            }
+
+            # Nonsensical rule name — common attacker pattern
+            if ($rule.Name -match '^[.\s;_\-]{1,3}$') {
+                Add-Finding 'Medium' 'InboxRule' "Rule '$($rule.Name)' has a suspicious (nonsensical) name" 'Single-character or punctuation-only names are a common attacker pattern.'
             }
         }
     }
@@ -663,9 +704,11 @@ function ConvertTo-HtmlReport {
     } elseif ($InboxRules.Data.Count -eq 0) {
         No-Data 5 'No inbox rules found.'
     } else {
+        $htmlSuspFolders = @('RSS Subscriptions', 'RSS Feeds', 'Deleted Items', 'Junk Email', 'Clutter', 'Sync Issues', 'Archive')
         ($InboxRules.Data | ForEach-Object {
-            $hasFwd = $_.ForwardTo -or $_.RedirectTo -or $_.ForwardAsAttachmentTo
-            $rowStyle = if ($hasFwd -or $_.DeleteMessage) { " style='background:#fff7ed;'" } else { '' }
+            $hasFwd         = $_.ForwardTo -or $_.RedirectTo -or $_.ForwardAsAttachmentTo
+            $isObscureMove  = $_.MoveToFolder -and $htmlSuspFolders -contains $_.MoveToFolder
+            $rowStyle = if ($hasFwd -or $_.DeleteMessage -or $isObscureMove) { " style='background:#fff7ed;'" } else { '' }
             $actions = @()
             if ($_.ForwardTo)            { $actions += "Forward: $($_.ForwardTo -join ', ')" }
             if ($_.RedirectTo)           { $actions += "Redirect: $($_.RedirectTo -join ', ')" }
