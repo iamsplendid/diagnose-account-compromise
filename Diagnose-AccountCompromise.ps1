@@ -529,7 +529,7 @@ function ConvertTo-HtmlReport {
         $baselineCountries = @($crBaseline |
             ForEach-Object { if ($_.Location) { $_.Location.CountryOrRegion } } |
             Where-Object { $_ } | Sort-Object -Unique)
-        $windowByCountry = @($crAll | Where-Object { $_.Location -and $_.Location.CountryOrRegion } |
+        $windowByCountry = @($crWindow | Where-Object { $_.Location -and $_.Location.CountryOrRegion } |
             Group-Object { $_.Location.CountryOrRegion })
         foreach ($grp in $windowByCountry) {
             if ($grp.Name -and $grp.Name -notin $baselineCountries) {
@@ -544,7 +544,7 @@ function ConvertTo-HtmlReport {
         }
 
         # 2. MFA-blocked credential attempts (valid creds stopped by MFA)
-        $mfaBlocked = @($crAll | Where-Object { $_.Status -and $_.Status.ErrorCode -ne 0 })
+        $mfaBlocked = @($crWindow | Where-Object { $_.Status -and $_.Status.ErrorCode -ne 0 })
         if ($mfaBlocked.Count -gt 0) {
             $topLoc = ($mfaBlocked |
                 Group-Object { if ($_.Location -and $_.Location.CountryOrRegion) { $_.Location.CountryOrRegion } else { 'Unknown' } } |
@@ -558,8 +558,8 @@ function ConvertTo-HtmlReport {
         }
 
         # 3. Risk events (high and medium reported separately)
-        $highRiskCr = @($crAll | Where-Object { $_.RiskLevelDuringSignIn -eq 'high' -or $_.RiskLevelAggregated -eq 'high' })
-        $medRiskCr  = @($crAll | Where-Object { $_.RiskLevelDuringSignIn -eq 'medium' -or $_.RiskLevelAggregated -eq 'medium' })
+        $highRiskCr = @($crWindow | Where-Object { $_.RiskLevelDuringSignIn -eq 'high' -or $_.RiskLevelAggregated -eq 'high' })
+        $medRiskCr  = @($crWindow | Where-Object { $_.RiskLevelDuringSignIn -eq 'medium' -or $_.RiskLevelAggregated -eq 'medium' })
         if ($highRiskCr.Count -gt 0) {
             $anomalies.Add([PSCustomObject]@{
                 Severity = 'High'
@@ -578,7 +578,7 @@ function ConvertTo-HtmlReport {
         }
 
         # 4. Legacy auth (credential-relevant -- bypasses MFA)
-        $legacyCr = @($crAll | Where-Object { $_.ClientAppUsed -match 'SMTP|IMAP|POP|MAPI|ActiveSync|Other clients' })
+        $legacyCr = @($crWindow | Where-Object { $_.ClientAppUsed -match 'SMTP|IMAP|POP|MAPI|ActiveSync|Other clients' })
         if ($legacyCr.Count -gt 0) {
             $protocols = ($legacyCr | Select-Object -ExpandProperty ClientAppUsed | Sort-Object -Unique) -join ', '
             $anomalies.Add([PSCustomObject]@{
@@ -590,7 +590,7 @@ function ConvertTo-HtmlReport {
         }
 
         # 5. Impossible travel: consecutive credential-relevant sign-ins from different countries < 4 hours apart
-        $crSorted = @($crAll | Sort-Object CreatedDateTime)
+        $crSorted = @($crWindow | Sort-Object CreatedDateTime)
         $seenTravelPairs = @{}
         for ($i = 1; $i -lt $crSorted.Count; $i++) {
             $prev = $crSorted[$i - 1]
@@ -908,5 +908,5 @@ if ($outDir -and -not (Test-Path $outDir)) {
 Write-Done "Report written to $resolvedPath"
 
 if ($IsWindows -or $env:OS -eq 'Windows_NT') {
-    Invoke-Item $OutputHtml
+    Invoke-Item $resolvedPath
 }
