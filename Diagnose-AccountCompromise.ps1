@@ -473,79 +473,155 @@ function ConvertTo-HtmlReport {
         }) -join "`n"
     }
 
-    # Sign-in profile summary
-    $profileRows = if (-not $SignIn.Ok -or $SignIn.All.Count -eq 0) {
-        No-Data 8 'No sign-in data available.'
+    # Sign-in summary (stat block + anomaly table)
+    $signInSummaryContent = if (-not $SignIn.Ok) {
+        "<div class='err'>Collector error: $(HtmlEncode $SignIn.Error)</div>"
+    } elseif ($SignIn.All.Count -eq 0) {
+        "<div class='muted'>No sign-in data available.</div>"
     } else {
-        $baseCountrySet = @($SignIn.Baseline |
+        $mfaErrorCodes = @(50074, 50076, 50079, 500121, 53004, 50158)
+
+        # Credential-relevant: successful or MFA-blocked (valid creds regardless of MFA outcome)
+        $crWindow = @($SignIn.InWindow | Where-Object {
+            ($_.Status -and $_.Status.ErrorCode -eq 0) -or
+            ($_.Status -and $_.Status.ErrorCode -in $mfaErrorCodes) -or
+            ($_.Status -and $_.Status.FailureReason -match 'MFA|strong auth|multi.factor|authentication strength')
+        })
+        $crAll = @($SignIn.All | Where-Object {
+            ($_.Status -and $_.Status.ErrorCode -eq 0) -or
+            ($_.Status -and $_.Status.ErrorCode -in $mfaErrorCodes) -or
+            ($_.Status -and $_.Status.FailureReason -match 'MFA|strong auth|multi.factor|authentication strength')
+        })
+        $crBaseline = @($SignIn.Baseline | Where-Object {
+            ($_.Status -and $_.Status.ErrorCode -eq 0) -or
+            ($_.Status -and $_.Status.ErrorCode -in $mfaErrorCodes) -or
+            ($_.Status -and $_.Status.FailureReason -match 'MFA|strong auth|multi.factor|authentication strength')
+        })
+
+        # --- Stat block (all counts from InWindow) ---
+        $statTotal   = $SignIn.InWindow.Count
+        $statSuccess = @($SignIn.InWindow | Where-Object { $_.Status -and $_.Status.ErrorCode -eq 0 }).Count
+        $statMfa     = @($SignIn.InWindow | Where-Object {
+            ($_.Status -and $_.Status.ErrorCode -in $mfaErrorCodes) -or
+            ($_.Status -and $_.Status.FailureReason -match 'MFA|strong auth|multi.factor|authentication strength')
+        }).Count
+        $statRisk    = @($SignIn.InWindow | Where-Object {
+            $_.RiskLevelDuringSignIn -in @('high','medium') -or $_.RiskLevelAggregated -in @('high','medium')
+        }).Count
+        $statLegacy  = @($crWindow | Where-Object {
+            $_.ClientAppUsed -match 'SMTP|IMAP|POP|MAPI|ActiveSync|Other clients'
+        }).Count
+
+        $tileTotal   = "<div class='stat-tile'><div class='stat-val'>$statTotal</div><div class='stat-lbl'>Sign-ins</div></div>"
+        $tileSuccess = "<div class='stat-tile'><div class='stat-val'>$statSuccess</div><div class='stat-lbl'>Successful</div></div>"
+        $mfaClass    = if ($statMfa   -gt 0) { 'stat-tile alert-red'    } else { 'stat-tile' }
+        $riskClass   = if ($statRisk  -gt 0) { 'stat-tile alert-red'    } else { 'stat-tile' }
+        $legacyClass = if ($statLegacy -gt 0) { 'stat-tile alert-orange' } else { 'stat-tile' }
+        $tileMfa     = "<div class='$mfaClass'><div class='stat-val'>$statMfa</div><div class='stat-lbl'>MFA Blocks</div></div>"
+        $tileRisk    = "<div class='$riskClass'><div class='stat-val'>$statRisk</div><div class='stat-lbl'>Risk Events</div></div>"
+        $tileLegacy  = "<div class='$legacyClass'><div class='stat-val'>$statLegacy</div><div class='stat-lbl'>Legacy Auth</div></div>"
+        $statBlock   = "<div class='stat-block'>$tileTotal$tileSuccess$tileMfa$tileRisk$tileLegacy</div>"
+
+        # --- Anomaly table (operates on credential-relevant sign-ins across 30 days) ---
+        $anomalies = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        # 1. New country: credential-relevant activity in window not seen in baseline
+        $baselineCountries = @($crBaseline |
             ForEach-Object { if ($_.Location) { $_.Location.CountryOrRegion } } |
             Where-Object { $_ } | Sort-Object -Unique)
-
-        $groups = $SignIn.All | Group-Object {
-            $c  = if ($_.Location -and $_.Location.CountryOrRegion) { $_.Location.CountryOrRegion } else { 'Unknown' }
-            $ap = if ($_.AppDisplayName) { $_.AppDisplayName } else { 'Unknown App' }
-            $os = if ($_.DeviceDetail -and $_.DeviceDetail.OperatingSystem) { $_.DeviceDetail.OperatingSystem }
-                  elseif ($_.ClientAppUsed) { $_.ClientAppUsed }
-                  else { 'Unknown' }
-            "$c|||$ap|||$os"
+        $windowByCountry = @($crAll | Where-Object { $_.Location -and $_.Location.CountryOrRegion } |
+            Group-Object { $_.Location.CountryOrRegion })
+        foreach ($grp in $windowByCountry) {
+            if ($grp.Name -and $grp.Name -notin $baselineCountries) {
+                $firstSeen = ($grp.Group | Sort-Object CreatedDateTime | Select-Object -First 1).CreatedDateTime
+                $anomalies.Add([PSCustomObject]@{
+                    Severity = 'High'
+                    Anomaly  = 'New country'
+                    Detail   = "$(HtmlEncode $grp.Name) &mdash; first seen $(HtmlEncode $firstSeen)"
+                    Count    = $grp.Count
+                })
+            }
         }
 
-        $profiles = @($groups | ForEach-Object {
-            $parts   = $_.Name -split '\|\|\|'
-            $entries = @($_.Group)
-            $country = $parts[0]
+        # 2. MFA-blocked credential attempts (valid creds stopped by MFA)
+        $mfaBlocked = @($crAll | Where-Object { $_.Status -and $_.Status.ErrorCode -ne 0 })
+        if ($mfaBlocked.Count -gt 0) {
+            $topLoc = ($mfaBlocked |
+                Group-Object { if ($_.Location -and $_.Location.CountryOrRegion) { $_.Location.CountryOrRegion } else { 'Unknown' } } |
+                Sort-Object Count -Descending | Select-Object -First 1).Name
+            $anomalies.Add([PSCustomObject]@{
+                Severity = 'High'
+                Anomaly  = 'MFA-blocked credential attempt'
+                Detail   = "Valid credentials blocked by MFA. Top location: $(HtmlEncode $topLoc)"
+                Count    = $mfaBlocked.Count
+            })
+        }
 
-            $isNewCountry = $country -notin @('Unknown', '') -and $country -notin $baseCountrySet
-            $hasRisk      = @($entries | Where-Object {
-                $_.RiskLevelDuringSignIn -in @('high','medium') -or
-                $_.RiskLevelAggregated   -in @('high','medium')
-            }).Count -gt 0
-            $isLegacy     = @($entries | Where-Object {
-                $_.ClientAppUsed -match 'SMTP|IMAP|POP|MAPI|ActiveSync|Other clients'
-            }).Count -gt 0
-            $uniqueIps    = @($entries | Select-Object -ExpandProperty IpAddress | Where-Object { $_ } | Sort-Object -Unique)
-            $lastSeen     = ($entries | Sort-Object CreatedDateTime -Descending | Select-Object -First 1).CreatedDateTime
-            $successCount = @($entries | Where-Object { $_.Status -and $_.Status.ErrorCode -eq 0 }).Count
-            $failCount    = $entries.Count - $successCount
+        # 3. Risk events (high and medium reported separately)
+        $highRiskCr = @($crAll | Where-Object { $_.RiskLevelDuringSignIn -eq 'high' -or $_.RiskLevelAggregated -eq 'high' })
+        $medRiskCr  = @($crAll | Where-Object { $_.RiskLevelDuringSignIn -eq 'medium' -or $_.RiskLevelAggregated -eq 'medium' })
+        if ($highRiskCr.Count -gt 0) {
+            $anomalies.Add([PSCustomObject]@{
+                Severity = 'High'
+                Anomaly  = 'High-risk sign-in'
+                Detail   = 'Entra Identity Protection flagged as high risk'
+                Count    = $highRiskCr.Count
+            })
+        }
+        if ($medRiskCr.Count -gt 0) {
+            $anomalies.Add([PSCustomObject]@{
+                Severity = 'Medium'
+                Anomaly  = 'Medium-risk sign-in'
+                Detail   = 'Entra Identity Protection flagged as medium risk'
+                Count    = $medRiskCr.Count
+            })
+        }
 
-            $reasons = @()
-            if ($isNewCountry) { $reasons += 'New country' }
-            if ($hasRisk)      { $reasons += 'Risk detected' }
-            if ($isLegacy)     { $reasons += 'Legacy auth' }
+        # 4. Legacy auth (credential-relevant -- bypasses MFA)
+        $legacyCr = @($crAll | Where-Object { $_.ClientAppUsed -match 'SMTP|IMAP|POP|MAPI|ActiveSync|Other clients' })
+        if ($legacyCr.Count -gt 0) {
+            $protocols = ($legacyCr | Select-Object -ExpandProperty ClientAppUsed | Sort-Object -Unique) -join ', '
+            $anomalies.Add([PSCustomObject]@{
+                Severity = 'High'
+                Anomaly  = 'Legacy auth (bypasses MFA)'
+                Detail   = "Protocol(s): $(HtmlEncode $protocols)"
+                Count    = $legacyCr.Count
+            })
+        }
 
-            [PSCustomObject]@{
-                Country      = $country
-                App          = $parts[1]
-                DeviceOS     = $parts[2]
-                Count        = $entries.Count
-                UniqueIPs    = $uniqueIps.Count
-                IpList       = $uniqueIps
-                LastSeen     = $lastSeen
-                SuccessCount = $successCount
-                FailCount    = $failCount
-                Reasons      = $reasons -join '; '
+        # 5. Impossible travel: consecutive credential-relevant sign-ins from different countries < 4 hours apart
+        $crSorted = @($crAll | Sort-Object CreatedDateTime)
+        for ($i = 1; $i -lt $crSorted.Count; $i++) {
+            $prev = $crSorted[$i - 1]
+            $curr = $crSorted[$i]
+            $prevCountry = if ($prev.Location) { $prev.Location.CountryOrRegion } else { $null }
+            $currCountry = if ($curr.Location) { $curr.Location.CountryOrRegion } else { $null }
+            if ($prevCountry -and $currCountry -and $prevCountry -ne $currCountry) {
+                $gapMin = ([datetime]$curr.CreatedDateTime - [datetime]$prev.CreatedDateTime).TotalMinutes
+                if ($gapMin -lt 240) {
+                    $h = [int]($gapMin / 60)
+                    $m = [int]($gapMin % 60)
+                    $anomalies.Add([PSCustomObject]@{
+                        Severity = 'High'
+                        Anomaly  = 'Impossible travel'
+                        Detail   = "$(HtmlEncode $prevCountry) &rarr; $(HtmlEncode $currCountry) (${h}h ${m}m apart)"
+                        Count    = 1
+                    })
+                }
             }
-        }) | Sort-Object { if ($_.Reasons -ne '') { 0 } else { 1 } }, { -$_.Count }
+        }
 
-        ($profiles | ForEach-Object {
-            $suspicious = $_.Reasons -ne ''
-            $hasFailures = $_.FailCount -gt 0
-            $rowStyle   = if ($suspicious)  { " style='background:#fff7ed;'" }
-                          elseif ($hasFailures) { " style='background:#fff7ed;'" }
-                          else                  { '' }
-            $sevClass    = if ($_.Reasons -match 'Risk') { 'High' } elseif ($suspicious) { 'Medium' } else { '' }
-            $rawFlagText = if ($suspicious) { $_.Reasons } else { '' }
-            $flagCell    = if ($suspicious) { "$(Sev-Badge $sevClass) $(HtmlEncode $rawFlagText)" } else { "<span class='muted'>clean</span>" }
-            $resultCell  = if ($_.FailCount -eq 0) {
-                "<span style='color:#166534;font-weight:600;'>$($_.SuccessCount) success</span>"
-            } elseif ($_.SuccessCount -eq 0) {
-                "<span style='color:#991b1b;font-weight:600;'>$($_.FailCount) failed</span>"
-            } else {
-                "<span style='color:#166534;font-weight:600;'>$($_.SuccessCount) success</span> / <span style='color:#991b1b;font-weight:600;'>$($_.FailCount) failed</span>"
-            }
-            $ipCell = ($_.IpList | ForEach-Object { HtmlEncode $_ }) -join '<br>'
-            "<tr$rowStyle><td>$(HtmlEncode $_.Country)</td><td>$(HtmlEncode $_.App)</td><td>$(HtmlEncode $_.DeviceOS)</td><td>$($_.Count)</td><td>$ipCell</td><td>$(HtmlEncode $_.LastSeen)</td><td>$resultCell</td><td>$flagCell</td></tr>"
-        }) -join "`n"
+        # Build anomaly HTML
+        $anomalyContent = if ($anomalies.Count -eq 0) {
+            "<div class='muted' style='padding:4px 0;'>No sign-in anomalies detected.</div>"
+        } else {
+            $rows = ($anomalies | ForEach-Object {
+                "<tr><td>$(Sev-Badge $_.Severity)</td><td>$(HtmlEncode $_.Anomaly)</td><td>$($_.Detail)</td><td>$($_.Count)</td></tr>"
+            }) -join "`n"
+            "<table><tr><th>Severity</th><th>Anomaly</th><th>Detail</th><th>Count</th></tr>`n$rows</table>"
+        }
+
+        "$statBlock$anomalyContent"
     }
 
     # Identity Protection
@@ -696,11 +772,8 @@ th { background:#eef3fb; font-weight:700; }
   </div>
 
   <div class="card">
-    <h2>Sign-In Profile Summary (30 days)</h2>
-    <div class="muted" style="margin-bottom:6px;">One row per unique country / app / device combination across the full 30-day window. Suspicious profiles are highlighted. &ldquo;New country&rdquo; means no sign-ins from that country in the baseline period prior to the lookback window.</div>
-    <table><tr><th>Country</th><th>App</th><th>Device / OS</th><th>Sign-ins</th><th>IPs</th><th>Last Seen</th><th>Result</th><th>Flags</th></tr>
-    $profileRows
-    </table>
+    <h2>Sign-In Summary (30 days)</h2>
+    $signInSummaryContent
   </div>
 
   <div class="card">
