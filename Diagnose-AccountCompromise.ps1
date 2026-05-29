@@ -591,6 +591,7 @@ function ConvertTo-HtmlReport {
 
         # 5. Impossible travel: consecutive credential-relevant sign-ins from different countries < 4 hours apart
         $crSorted = @($crAll | Sort-Object CreatedDateTime)
+        $seenTravelPairs = @{}
         for ($i = 1; $i -lt $crSorted.Count; $i++) {
             $prev = $crSorted[$i - 1]
             $curr = $crSorted[$i]
@@ -599,14 +600,18 @@ function ConvertTo-HtmlReport {
             if ($prevCountry -and $currCountry -and $prevCountry -ne $currCountry) {
                 $gapMin = ([datetime]$curr.CreatedDateTime - [datetime]$prev.CreatedDateTime).TotalMinutes
                 if ($gapMin -lt 240) {
-                    $h = [int]($gapMin / 60)
-                    $m = [int]($gapMin % 60)
-                    $anomalies.Add([PSCustomObject]@{
-                        Severity = 'High'
-                        Anomaly  = 'Impossible travel'
-                        Detail   = "$(HtmlEncode $prevCountry) &rarr; $(HtmlEncode $currCountry) (${h}h ${m}m apart)"
-                        Count    = 1
-                    })
+                    $pairKey = "$prevCountry|||$currCountry"
+                    if (-not $seenTravelPairs.ContainsKey($pairKey)) {
+                        $seenTravelPairs[$pairKey] = $true
+                        $h = [int]($gapMin / 60)
+                        $m = [int]($gapMin % 60)
+                        $anomalies.Add([PSCustomObject]@{
+                            Severity = 'High'
+                            Anomaly  = 'Impossible travel'
+                            Detail   = "$(HtmlEncode $prevCountry) &rarr; $(HtmlEncode $currCountry) (${h}h ${m}m apart)"
+                            Count    = 1
+                        })
+                    }
                 }
             }
         }
@@ -772,7 +777,7 @@ th { background:#eef3fb; font-weight:700; }
   </div>
 
   <div class="card">
-    <h2>Sign-In Summary (30 days)</h2>
+    <h2>Sign-In Summary (last ${DaysBack} days)</h2>
     $signInSummaryContent
   </div>
 
