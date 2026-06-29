@@ -164,25 +164,54 @@ function Get-AuthMethods {
 
 function Get-SignInActivity {
     param([string]$Upn, [int]$DaysBack)
-    Write-Step "Collecting sign-in logs (30-day window)..."
+    Write-Step "Collecting sign-in logs..."
     try {
-        $thirtyDaysAgo = (Get-Date).AddDays(-30).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        $escapedUpn = $Upn -replace "'", "''"
-        $filter = "userPrincipalName eq '$escapedUpn' and createdDateTime ge $thirtyDaysAgo"
-        $all = @(Get-MgAuditLogSignIn -Filter $filter -All -ErrorAction Stop)
-        $cutoff = (Get-Date).AddDays(-$DaysBack)
-        $inWindow = @($all | Where-Object { [datetime]$_.CreatedDateTime -ge $cutoff })
-        $baseline = @($all | Where-Object { [datetime]$_.CreatedDateTime -lt $cutoff })
-        Write-Done "Sign-ins: $($inWindow.Count) in window, $($baseline.Count) in baseline"
+        $escapedUpn    = $Upn -replace "'", "''"
+        $now           = Get-Date
+        $windowStart   = $now.AddDays(-$DaysBack).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $baselineStart = $now.AddDays(-30).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+        $windowFilter   = "userPrincipalName eq '$escapedUpn' and createdDateTime ge $windowStart"
+        $baselineFilter = "userPrincipalName eq '$escapedUpn' and createdDateTime ge $baselineStart and createdDateTime lt $windowStart"
+
+        $windowCap   = 2000
+        $baselineCap = 500
+
+        $windowRaw = @(Get-MgAuditLogSignIn -Filter $windowFilter -All -PageSize 999 -ErrorAction Stop |
+            Select-Object -First ($windowCap + 1))
+        $windowTruncated = $windowRaw.Count -gt $windowCap
+        $inWindow = if ($windowTruncated) { @($windowRaw | Select-Object -First $windowCap) } else { $windowRaw }
+
+        $baselineRaw = @(Get-MgAuditLogSignIn -Filter $baselineFilter -All -PageSize 999 -ErrorAction Stop |
+            Select-Object -First ($baselineCap + 1))
+        $baselineTruncated = $baselineRaw.Count -gt $baselineCap
+        $baseline = if ($baselineTruncated) { @($baselineRaw | Select-Object -First $baselineCap) } else { $baselineRaw }
+
+        $all = @($inWindow) + @($baseline)
+
+        $windowLabel   = "$($inWindow.Count)$(if ($windowTruncated) { '+' })"
+        $baselineLabel = "$($baseline.Count)$(if ($baselineTruncated) { '+' })"
+        Write-Done "Sign-ins: $windowLabel in window, $baselineLabel in baseline"
+
         return [PSCustomObject]@{
-            Ok       = $true
-            All      = $all
-            InWindow = $inWindow
-            Baseline = $baseline
+            Ok                = $true
+            All               = $all
+            InWindow          = $inWindow
+            Baseline          = $baseline
+            WindowTruncated   = $windowTruncated
+            BaselineTruncated = $baselineTruncated
         }
     } catch {
         Write-Fail "Get-SignInActivity failed: $($_.Exception.Message)"
-        return [PSCustomObject]@{ Ok = $false; Error = $_.Exception.Message; All = @(); InWindow = @(); Baseline = @() }
+        return [PSCustomObject]@{
+            Ok                = $false
+            Error             = $_.Exception.Message
+            All               = @()
+            InWindow          = @()
+            Baseline          = @()
+            WindowTruncated   = $false
+            BaselineTruncated = $false
+        }
     }
 }
 
