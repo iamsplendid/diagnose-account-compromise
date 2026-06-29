@@ -557,11 +557,6 @@ function ConvertTo-HtmlReport {
             ($_.Status -and $_.Status.ErrorCode -in $mfaErrorCodes) -or
             ($_.Status -and $_.Status.FailureReason -match 'MFA|strong auth|multi.factor|authentication strength')
         })
-        $crAll = @($SignIn.All | Where-Object {
-            ($_.Status -and $_.Status.ErrorCode -eq 0) -or
-            ($_.Status -and $_.Status.ErrorCode -in $mfaErrorCodes) -or
-            ($_.Status -and $_.Status.FailureReason -match 'MFA|strong auth|multi.factor|authentication strength')
-        })
         $crBaseline = @($SignIn.Baseline | Where-Object {
             ($_.Status -and $_.Status.ErrorCode -eq 0) -or
             ($_.Status -and $_.Status.ErrorCode -in $mfaErrorCodes) -or
@@ -582,7 +577,8 @@ function ConvertTo-HtmlReport {
             $_.ClientAppUsed -match 'SMTP|IMAP|POP|MAPI|ActiveSync|Other clients'
         }).Count
 
-        $tileTotal   = "<div class='stat-tile'><div class='stat-val'>$statTotal</div><div class='stat-lbl'>Sign-ins</div></div>"
+        $totalLabel  = if ($SignIn.WindowTruncated) { "$statTotal+" } else { "$statTotal" }
+        $tileTotal   = "<div class='stat-tile'><div class='stat-val'>$totalLabel</div><div class='stat-lbl'>Sign-ins</div></div>"
         $tileSuccess = "<div class='stat-tile'><div class='stat-val'>$statSuccess</div><div class='stat-lbl'>Successful</div></div>"
         $mfaClass    = if ($statMfa   -gt 0) { 'stat-tile alert-red'    } else { 'stat-tile' }
         $riskClass   = if ($statRisk  -gt 0) { 'stat-tile alert-red'    } else { 'stat-tile' }
@@ -696,7 +692,15 @@ function ConvertTo-HtmlReport {
             "<table><tr><th>Severity</th><th>Anomaly</th><th>Detail</th><th>Count</th></tr>`n$rows</table>"
         }
 
-        "$statBlock$anomalyContent"
+        $truncationBanner = ''
+        if ($SignIn.WindowTruncated -and $SignIn.BaselineTruncated) {
+            $truncationBanner = "<div style='background:#fff7ed;border:1px solid #fed7aa;border-radius:4px;padding:6px 10px;margin-bottom:8px;font-size:11px;color:#c2410c;'>Sign-in data capped at 2,000 records (most recent first). Older sign-ins in this window were not loaded. Baseline sample also capped at 500 records &mdash; new-country detection may be incomplete.</div>"
+        } elseif ($SignIn.WindowTruncated) {
+            $truncationBanner = "<div style='background:#fff7ed;border:1px solid #fed7aa;border-radius:4px;padding:6px 10px;margin-bottom:8px;font-size:11px;color:#c2410c;'>Sign-in data capped at 2,000 records (most recent first). Older sign-ins in this window were not loaded.</div>"
+        } elseif ($SignIn.BaselineTruncated) {
+            $truncationBanner = "<div style='background:#fff7ed;border:1px solid #fed7aa;border-radius:4px;padding:6px 10px;margin-bottom:8px;font-size:11px;color:#c2410c;'>Baseline sample capped at 500 records &mdash; new-country detection may be incomplete.</div>"
+        }
+        "$statBlock$truncationBanner$anomalyContent"
     }
 
     # Identity Protection
@@ -860,7 +864,7 @@ th { background:#eef3fb; font-weight:700; }
 
   <div class="card">
     <h2>Sign-In Activity (last ${DaysBack} days)</h2>
-    <div class="muted" style="margin-bottom:6px;">$(if ($SignIn.Ok) { "Showing $($SignIn.InWindow.Count) sign-in(s). Baseline (days $DaysBack-30): $($SignIn.Baseline.Count) sign-in(s)." })</div>
+    <div class="muted" style="margin-bottom:6px;">$(if ($SignIn.Ok) { "Showing $($SignIn.InWindow.Count)$(if ($SignIn.WindowTruncated) { '+' }) sign-in(s). Baseline (days $DaysBack-30): $($SignIn.Baseline.Count)$(if ($SignIn.BaselineTruncated) { '+' }) sign-in(s)." })</div>
     <table><tr><th>Timestamp</th><th>IP</th><th>Location</th><th>App</th><th>CA Status</th><th>Risk Level</th><th>Result</th></tr>
     $signInRows
     </table>
