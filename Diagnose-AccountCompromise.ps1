@@ -177,15 +177,22 @@ function Get-SignInActivity {
         $windowCap   = 2000
         $baselineCap = 500
 
-        $windowRaw = @(Get-MgAuditLogSignIn -Filter $windowFilter -All -PageSize 999 -ErrorAction Stop |
+        $windowRaw = @(Get-MgAuditLogSignIn -Filter $windowFilter -All -PageSize 999 -Sort "createdDateTime desc" -ErrorAction Stop |
             Select-Object -First ($windowCap + 1))
         $windowTruncated = $windowRaw.Count -gt $windowCap
         $inWindow = if ($windowTruncated) { @($windowRaw | Select-Object -First $windowCap) } else { $windowRaw }
 
-        $baselineRaw = @(Get-MgAuditLogSignIn -Filter $baselineFilter -All -PageSize 999 -ErrorAction Stop |
-            Select-Object -First ($baselineCap + 1))
-        $baselineTruncated = $baselineRaw.Count -gt $baselineCap
-        $baseline = if ($baselineTruncated) { @($baselineRaw | Select-Object -First $baselineCap) } else { $baselineRaw }
+        $baselineTruncated = $false
+        $baseline = @()
+        try {
+            $baselineRaw = @(Get-MgAuditLogSignIn -Filter $baselineFilter -All -PageSize 999 -Sort "createdDateTime desc" -ErrorAction Stop |
+                Select-Object -First ($baselineCap + 1))
+            $baselineTruncated = $baselineRaw.Count -gt $baselineCap
+            $baseline = if ($baselineTruncated) { @($baselineRaw | Select-Object -First $baselineCap) } else { $baselineRaw }
+        } catch {
+            Write-Warn "Baseline sign-in query failed (country comparison unavailable): $($_.Exception.Message)"
+            $baselineTruncated = $true
+        }
 
         $all = @($inWindow) + @($baseline)
 
